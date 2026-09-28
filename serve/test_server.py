@@ -14,7 +14,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import ChatTemplate  # noqa: E402
-from serve.server import CTX_SLACK, ByteTokenizer, EngineDied, MockEngine, Service, serve  # noqa: E402
+from serve.server import CTX_SLACK, ByteTokenizer, EngineDied, MockEngine, Service, StrataEngine, serve  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 CTX = 4096
@@ -163,6 +163,131 @@ class FitMaxTokens(unittest.TestCase):
         s, b, _, _ = self.call("openai", text="y" * (CTX - CTX_SLACK - overhead), max_tokens=100)
         self.assertEqual(s, 400, b)
         self.assertIn("no room to answer", b["error"]["message"])
+
+
+class ClientShapes(unittest.TestCase):
+    """What real clients send: Claude Code posts /v1/messages?beta=true (issue #55) and puts hook context into the
+    conversation as a mid-conversation system message (issue #56); some OpenAI clients send a late developer message."""
+
+    @classmethod
+    def setUpClass(cls):
+        tok = ByteTokenizer()
+        cls.engine = RecordingPrompt(tok, "</think>\n\n2", max_context=CTX)
+        cls.svc = Service(cls.engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        cls.httpd = serve(cls.svc, port=0)
+        cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+
+    def post(self, path, body):
+        req = urllib.request.Request(self.base + path, data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json", "anthropic-version": "2023-06-01"})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return r.status, json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            with e:
+                return e.code, json.loads(e.read())
+
+    def prompt_text(self):
+        return bytes(i for i in self.engine.last_ids if i < 256).decode("utf-8", "replace")
+
+    def test_query_string(self):
+        body = {"model": "x", "max_tokens": 20, "messages": [{"role": "user", "content": "hi"}]}
+        for path in ("/v1/messages?beta=true", "/v1/chat/completions?api-version=1", "/v1/messages/?beta=true"):
+            status, b = self.post(path, body)
+            self.assertEqual(status, 200, (path, b))
+        status, _ = self.post("/v1/nothing?beta=true", body)
+        self.assertEqual(status, 404)
+
+    def test_anthropic_mid_conversation_system(self):
+        status, b = self.post("/v1/messages?beta=true", {
+            "model": "x", "max_tokens": 50,
+            "system": [{"type": "text", "text": "You are terse."}],
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "1+1? digits only"}]},
+                {"role": "system", "content": [{"type": "text", "text": "<system-reminder>answer in digits</system-reminder>"}]}]})
+        self.assertEqual(status, 200, b)
+        text = self.prompt_text()
+        self.assertIn("You are terse.", text)
+        self.assertIn("<system-reminder>answer in digits</system-reminder>", text)
+        self.assertLess(text.index("You are terse."), text.index("1+1?"))          # the first system stays first
+        self.assertLess(text.index("1+1?"), text.index("answer in digits"))        # the late one stays in place
+
+    def test_openai_late_developer_and_system(self):
+        status, b = self.post("/v1/chat/completions", {
+            "model": "x", "max_tokens": 50,
+            "messages": [{"role": "system", "content": "Be brief."}, {"role": "user", "content": "hello"},
+                         {"role": "assistant", "content": "hi"}, {"role": "developer", "content": "Now use digits."},
+                         {"role": "system", "content": "Also this."}, {"role": "user", "content": "1+1?"}]})
+        self.assertEqual(status, 200, b)
+        text = self.prompt_text()
+        for part in ("Be brief.", "Now use digits.", "Also this.", "1+1?"):
+            self.assertIn(part, text)
+
+    def test_leading_system_unchanged(self):
+        from serve.frontend import anthropic_to_messages, openai_to_messages
+        msgs, _, _ = openai_to_messages({"messages": [{"role": "developer", "content": "D"}, {"role": "user", "content": "u"}]})
+        self.assertEqual([m["role"] for m in msgs], ["system", "user"])
+        msgs, _, _ = anthropic_to_messages({"system": "S", "messages": [{"role": "user", "content": "u"}]})
+        self.assertEqual([m["role"] for m in msgs], ["system", "user"])
+
+
+class SamplingKeys(unittest.TestCase):
+    """The GEN line's sampling keys: top_k 0 ("off") or wider than the engine's 64 get the widest list, 64 (they used
+    to fall back to the engine default 20); a penalty always carries its window."""
+
+    def keys(self, **sampling):
+        return StrataEngine.sampling_keys(sampling).split()
+
+    def test_top_k(self):
+        self.assertIn("top_k=10", self.keys(temperature=0.7, top_k=10))
+        self.assertIn("top_k=64", self.keys(temperature=0.7, top_k=64))
+        self.assertIn("top_k=64", self.keys(temperature=0.7, top_k=0))
+        self.assertIn("top_k=64", self.keys(temperature=0.7, top_k=100))
+        for bad in (-1, True, 2.5, "20"):
+            self.assertFalse([k for k in self.keys(temperature=0.7, top_k=bad) if k.startswith("top_k=")], bad)
+
+    def test_tune_keys(self):
+        k = self.keys(temperature=0, strata_tune={"pcie_frac": 0.2, "spec_min_p": 0.7})
+        self.assertIn("pcie_frac=0.2", k)
+        self.assertIn("spec_min_p=0.7", k)
+        bad = self.keys(strata_tune={"pcie_frac": 3, "spec_min_p": True, "pool_workers": 2})
+        self.assertFalse([x for x in bad if x.split("=")[0] in ("pcie_frac", "spec_min_p", "pool_workers")])
+
+    def test_penalty_window(self):
+        self.assertIn("penalty_last_n=64", self.keys(presence_penalty=1.5))
+        self.assertIn("penalty_last_n=4096", self.keys(repetition_penalty=1.1, penalty_last_n=4096))
+        self.assertFalse([k for k in self.keys(temperature=0.7) if k.startswith("penalty")])
+
+
+class GpuChoice(unittest.TestCase):
+    """Issue #51: the config's \"gpu\" reaches the engine as CUDA_VISIBLE_DEVICES, numbered like nvidia-smi."""
+
+    def test_env(self):
+        from serve.server import child_env, override_gpu
+        env = child_env({"gpu": 1})
+        self.assertEqual(env["CUDA_VISIBLE_DEVICES"], "1")
+        self.assertEqual(env["CUDA_DEVICE_ORDER"], "PCI_BUS_ID")
+        saved = {"gpu": 0, "env": {"CUDA_VISIBLE_DEVICES": "GPU-main,GPU-extra"},
+                 "args": ["--pack", "pack", "--extra-gpus", "1", "--extra-gpus-optional"]}
+        self.assertEqual(child_env(saved)["CUDA_VISIBLE_DEVICES"], "GPU-main,GPU-extra")
+        chosen = override_gpu(saved, 1)
+        self.assertEqual(child_env(chosen)["CUDA_VISIBLE_DEVICES"], "1")
+        self.assertEqual(chosen["args"], ["--pack", "pack"])
+        self.assertEqual(saved["args"][-3:], ["--extra-gpus", "1", "--extra-gpus-optional"])
+        plain = child_env({})                     # no choice: the environment as it was (existing installs)
+        self.assertEqual(plain.get("CUDA_VISIBLE_DEVICES"), os.environ.get("CUDA_VISIBLE_DEVICES"))
+        self.assertEqual(plain.get("CUDA_DEVICE_ORDER"), os.environ.get("CUDA_DEVICE_ORDER"))
+
+
+class RecordingPrompt(MockEngine):
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        self.last_ids = list(ids)
+        yield from super().generate(ids, max_new, sampling, cancel, embeddings)
 
 
 class DyingEngine(MockEngine):

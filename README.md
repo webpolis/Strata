@@ -39,6 +39,9 @@ A card with more VRAM is faster, because more of the model fits on the GPU: an R
 100-140 tokens per second. All measurements, long-context numbers and estimates for other cards are in the
 [details](docs/DETAILS.md#speed-measured).
 
+Every PC is different: `START-HERE.bat --calibrate` measures a few engine settings on yours and keeps the fastest
+(about 5-10 minutes; on the PC above it made the Coder 7% faster).
+
 ## Which model should I pick?
 
 **The size** (the same model, compressed more or less):
@@ -69,7 +72,7 @@ lower the RAM needed.
   token, and about the same RAM as the same size of the original (no IQ3_S). Its own license applies (see its page).
 
 Not sure? Take **IQ2_XS** - or the **Coder** if you mainly write code, or have 32-48 GB of RAM. You can add another
-one later with `START-HERE.bat --setup`.
+one later with `SETUP.bat` (the same as `START-HERE.bat --setup`; on Linux `./setup.sh --setup`).
 
 ## Install
 
@@ -151,7 +154,7 @@ Usually not enough RAM (on Linux the system then stops the engine). Just send yo
 engine by itself. If it keeps happening, close other programs or pick a smaller size.
 
 **It says the prompt exceeds the context.**
-The conversation is longer than the context you chose. Start a new chat, or run `START-HERE.bat --setup` and pick more
+The conversation is longer than the context you chose. Start a new chat, or run `SETUP.bat` and pick more
 context.
 
 **Still stuck?** Look in the [full troubleshooting table](docs/DETAILS.md#troubleshooting), or open an issue and

@@ -4,7 +4,8 @@ The technical side of Strata: every measured number, the API, images, all settin
 New here? Start with the [README](../README.md) - it has everything you need to install and use it.
 
 > **On this page:** [Speed](#speed-measured) · [Other GPUs](#other-gpus-estimated) · [Which model?](#which-model) ·
-> [Requirements](#before-you-start) · [Windows](#windows) · [Linux](#linux) · [API](#using-it) · [Images](#images-vision) ·
+> [Requirements](#before-you-start) · [Windows](#windows) · [Linux](#linux) · [API](#using-it) ·
+> [MCP tools](#tools-from-mcp-servers) · [Images](#images-vision) ·
 > [Troubleshooting](#troubleshooting) · [How it works](#how-it-works)
 
 ---
@@ -104,7 +105,7 @@ of [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next).
 | **IQ2_XS** | 68 GB | ~36 GB experts + ~6 GB | close to Q2_0 | a bit better |
 | **IQ3_XXS** | 76 GB | ~43 GB experts + ~6 GB | slower (more CPU work) | best |
 
-With 64 GB of RAM all three fit (close the browser for IQ3_XXS, and keep its context at 128K or less). With 48 GB only Q2_0 / IQ2_XS may fit. 32 GB is not enough.
+With 64 GB of RAM all three fit (close the browser for IQ3_XXS, and keep its context at 128K or less). With 48 GB only Q2_0 / IQ2_XS may fit. With 32 GB: the Coder (below).
 
 ### Or: the Coder (half the experts, for code)
 
@@ -193,13 +194,27 @@ downloaded again. Closing the window stops the model.
 
 ```
 START-HERE.bat --setup                          install another model, or change context / images
+SETUP.bat                                       the same (double-click it)
 START-HERE.bat --model IQ2_XS --context 32768 --vision yes --yes     no questions
 START-HERE.bat --gguf-dir D:\models\IQ2_XS       use GGUF files you already have
 START-HERE.bat --data-dir E:\Strata-data         keep the model files somewhere else
 START-HERE.bat --port 8081                      another port
+START-HERE.bat --gpu 1                          another GPU (numbered as nvidia-smi; setup picks the one with the most VRAM)
+START-HERE.bat --calibrate                      tune the engine for this PC (about 5-10 minutes), then start
 ```
 
 With more than one model installed, it asks which one to start. `run-<model>.bat` starts a model directly.
+
+**Tuning for your PC (`--calibrate`, engine 0.1.19).** Three engine settings depend on the PC more than on the model:
+- the share of the experts missing from VRAM that are copied to the GPU instead of computed by the CPU
+  (`--pcie-frac`: a fast PCIe link and a slower CPU want more, a laptop's narrower link less);
+- how sure the draft layer must be to add another guess to a check (`--spec-min-p`);
+- how many CPU threads compute experts (`--pool-workers`: on CPUs with efficiency cores, fewer can be faster).
+
+The defaults were measured on a Ryzen 5 7600 with an RTX 5070. Setup offers to measure them on your PC after an
+install; `START-HERE.bat --calibrate` (Linux: `./setup.sh --calibrate`) does it any time. It measures the output
+speed with each setting and keeps one only when it is more than 3% faster. The result is remembered per PC and model
+(in the settings file next to the data folder's record), so updates keep it.
 
 ### Chat in the terminal (optional)
 
@@ -242,6 +257,7 @@ The server listens on `http://127.0.0.1:8080` (change with `--port` in setup, or
 | Model list / health | `GET /v1/models`, `GET /health` |
 | What the model is doing right now | `GET /status` |
 | Everything the Monitor tab shows (engine, live state, last requests, hardware) | `GET /metrics` |
+| The MCP servers, their state and tools ([below](#tools-from-mcp-servers)) | `GET /mcp` |
 
 ```bash
 curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" -d '{
@@ -273,6 +289,9 @@ print(r.choices[0].message.content)
   15 s, and `GET /status` says what it is doing (`reading the prompt`, `answering`, tokens so far). Closing the
   connection or pressing stop in your app really stops the model, so the next request starts at once.
 - **Chat apps.** Any app with an "OpenAI-compatible" provider works: base URL `http://127.0.0.1:8080/v1`, any API key.
+- **Claude Code** (Strata 0.1.17 or newer): set `ANTHROPIC_BASE_URL=http://127.0.0.1:8080` and
+  `ANTHROPIC_MODEL` to a Claude model name it knows (it refuses names it doesn't; Strata ignores the name), plus any
+  `ANTHROPIC_AUTH_TOKEN` (or your `api_key`, if you set one).
 - **Context.** Chosen in setup (8K-262K). Requests longer than that are refused, never silently cut. A request whose
   `max_tokens` would run past the context is refused too (400); agents that always ask for their full output cap
   can instead get it shortened to the room left: add `"fit_max_tokens": true` to `strata-<model>.json` (or pass
@@ -303,7 +322,52 @@ engine arguments. The run config's optional `sampling` block sets the defaults f
 block at all a request without sampling keys decodes greedy. The penalties (`presence_penalty`, `frequency_penalty`,
 `repetition_penalty`, with `penalty_last_n` capping how many recent tokens they count over, default 64 when any
 penalty is set) ride the same path; they count the tokens the request has consumed, so a repetition penalty
-suppresses what the model itself just said, not the prompt alone.
+suppresses what the model itself just said, not the prompt alone. Since engine 0.1.19 they apply to every token
+the speculative decoding checks at once, exactly as if it decoded one token at a time (before, only the first of
+each batch got them). That makes requests with penalties 1-11% slower than in 0.1.18: the draft layer guesses
+without penalties, so more of its guesses are now rejected. Requests without penalties are unchanged. `top_k` keeps at most 64 candidates: `0` ("off") or anything above 64 uses all 64.
+
+---
+
+## Tools from MCP servers
+
+The chat page can give the model tools from [MCP](https://modelcontextprotocol.io) servers, as LM Studio and Claude
+Desktop do: reading your files, fetching web pages, searching, anything an MCP server offers. List the servers in
+`strata-<model>.json` under `"mcp_servers"` - the same shape as Claude Desktop's `mcpServers` block, which you can
+also paste as it is (key `"mcpServers"`):
+
+```json
+"mcp_servers": {
+  "files": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "C:\\Users\\me\\Documents\\notes"]},
+  "search": {"url": "http://127.0.0.1:3000/mcp", "headers": {"Authorization": "Bearer ..."}}
+},
+"mcp": {"timeout_s": 60, "max_result_chars": 20000, "max_rounds": 8}
+```
+
+Or keep them in their own file and start the server with `--mcp-config path\to\claude_desktop_config.json` (a file
+with an `mcpServers` block; add it to the `serve/server.py` line of your run script). Restart Strata after a change.
+
+- **A program** (`command`, `args`, optional `env` and `cwd`) is started by Strata and spoken to over its
+  stdin/stdout; `npx`, `uvx`, `python` and friends are found on `PATH` as usual (Node.js is needed for `npx`
+  servers). **An address** (`url`, optional `headers`) uses MCP's Streamable HTTP transport (the older SSE-only
+  transport is not supported). `"disabled": true` leaves an entry out.
+- The servers start with Strata, in the background; the server window says what each one offers
+  (`MCP server 'files': 14 tools (...)`), or why it did not start - its tools are then left out and the chat works
+  without them. The Monitor tab lists them, and the Sampling drawer has **Use tools from MCP servers** (on by
+  default). A server that stops later is started again at its next call.
+- In the chat each call shows as a small block (tool, arguments, result); the model reads the result and goes on,
+  up to `max_rounds` calls in a row per answer. A tool that fails or takes longer than `timeout_s` (default 60 s)
+  gives the model an `error: ...` result instead of ending the chat. Results longer than `max_result_chars`
+  (default 20,000 characters) are cut, with a note, before the model reads them. Stop stops a running tool too.
+- Only the chat page uses them. API clients (omp, Claude Code, OpenAI and Anthropic SDKs) see the API exactly as
+  before and keep their own tools; a request to `/v1/chat/completions` opts in with `"strata_mcp": true` (it then
+  gets `strata_mcp` tool events in the stream).
+
+**Security.** MCP tools run on your PC with your user's rights, and **the model decides when to call them** - also
+because of what it reads (a web page or a file can contain instructions). Give a filesystem server only the folders
+it needs, prefer read-only tools, and don't add servers you don't trust. The tools can only be used from the chat
+page itself (a request with another site's Origin or without a JSON content type is refused); if Strata is reachable
+from other devices, set an API key.
 
 ---
 
@@ -428,6 +492,7 @@ the document, +0.4% on the chat. Details: `bench/results/2026-09-27-esp/`.
 | Python or the build tools could not be installed | Install what it names (links are printed), then run it again. Everything already done is kept. |
 | `port 8080 is already in use` | Strata is already running (look for its window), or another program uses the port: `START-HERE.bat --port 8081`. |
 | `cudaHostRegister ... out of memory` in the log | Normal on Windows: the engine pins the experts in per-layer slices instead. Only a problem if the load then fails. |
+| `ExpertCache: cudaMalloc(...) failed: out of memory` although VRAM is free | Windows' page file is off or tiny: every allocation on the graphics card is also charged to Windows' commit (RAM + page file). Set the page file to "System managed" (System > About > Advanced system settings > Performance > Advanced > Virtual memory) and restart. Since 0.1.19 the engine retries with a smaller cache instead of stopping, and setup warns about a page file under 4 GB (issue #60). |
 | The first start takes minutes | It is reading 34-55 GB into RAM; the second start is faster while the files are in the OS cache. |
 | The PC freezes for a few minutes at the start | Normal, most of all the first time (the server window says when it happens): the engine loads the experts into RAM, pins part of it for the GPU and sizes the expert cache. Wait; don't close the window. Still frozen after 10 minutes: restart the PC, close other programs, try again, or pick a smaller size. |
 | `the engine stopped unexpectedly (exit code ...)` | The engine process ended mid-answer - usually out of RAM (Linux ends the biggest program: `sudo dmesg \| grep -i -E 'killed process\|out of memory'`). The next request starts it again by itself. If it repeats: close other programs or pick a smaller size. The server also warns at start when the model's experts leave less than ~6 GB of RAM for everything else. |
