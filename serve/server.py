@@ -434,8 +434,9 @@ class Vision:
 
 def child_env(cfg: dict) -> dict:
     """The engine's environment: the CUDA libraries setup installed (pip's nvidia packages, or the toolkit that
-    compiled it) first on the library search path."""
+    compiled it) first on the library search path, plus the config's own `env` (which GPUs, in which order)."""
     env = dict(os.environ)
+    env.update(cfg.get("env") or {})
     dirs = [d for d in cfg.get("lib_dirs") or [] if Path(d).is_dir()]
     if dirs:
         var = "PATH" if os.name == "nt" else "LD_LIBRARY_PATH"
