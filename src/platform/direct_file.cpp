@@ -4,7 +4,10 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <condition_variable>
 #include <deque>
+#include <mutex>
+#include <thread>
 #include <vector>
 
 #if defined(_WIN32)
@@ -185,12 +188,40 @@ void DirectFile::wake() {
 
 #else
 // ------------------------------------------------------------------------------------------------ POSIX
-// Phase L replaces this with io_uring. Until then a read completes inside `submit`, which is correct and
-// keeps the tree compiling on Linux (plan v0.3 section 5.1 rule 4).
+// A small pool of reader threads, each issuing a blocking O_DIRECT pread: the table's rows are scattered, so a
+// window's reads only overlap when several are in flight.  Four is where a USB SSD behind ntfs-3g stopped scaling
+// (1: 3,071 random 4 KB reads/s, 4: 5,163, 16: 4,736, 32: 2,520).
 struct DirectFile::Impl {
+    struct Req {
+        uint64_t offset, tag;
+        void* buffer;
+        uint32_t length;
+    };
+    static constexpr int kThreads = 4;
     int fd = -1;
     uint64_t size = 0;
+    std::mutex mu;
+    std::condition_variable cv_req, cv_done;
+    std::deque<Req> reqs;
     std::deque<Completion> done;
+    int wakes = 0;
+    bool stop = false;
+    std::vector<std::thread> threads;
+
+    void reader() {
+        std::unique_lock<std::mutex> lk(mu);
+        for (;;) {
+            cv_req.wait(lk, [&] { return stop || !reqs.empty(); });
+            if (stop) return;
+            const Req r = reqs.front();
+            reqs.pop_front();
+            lk.unlock();
+            const ssize_t got = pread(fd, r.buffer, r.length, (off_t) r.offset);
+            lk.lock();
+            done.push_back(Completion{r.tag, got < 0 ? 0u : (uint32_t) got, got >= 0});
+            cv_done.notify_all();
+        }
+    }
 };
 
 DirectFile::DirectFile() : impl_(new Impl) {}
@@ -203,14 +234,25 @@ bool DirectFile::open(const std::string& path, std::string& err) {
     struct stat st;
     if (fstat(impl_->fd, &st) != 0) { err = "DirectFile: cannot size " + path; close(); return false; }
     impl_->size = (uint64_t) st.st_size;
+    impl_->stop = false;
+    for (int i = 0; i < Impl::kThreads; ++i) impl_->threads.emplace_back([this] { impl_->reader(); });
     return true;
 }
 
 void DirectFile::close() {
+    {
+        std::lock_guard<std::mutex> lk(impl_->mu);
+        impl_->stop = true;
+    }
+    impl_->cv_req.notify_all();
+    for (std::thread& t : impl_->threads) t.join();
+    impl_->threads.clear();
     if (impl_->fd >= 0) ::close(impl_->fd);
     impl_->fd = -1;
     impl_->size = 0;
+    impl_->reqs.clear();
     impl_->done.clear();
+    impl_->wakes = 0;
 }
 
 bool DirectFile::is_open() const { return impl_->fd >= 0; }
@@ -221,15 +263,32 @@ bool DirectFile::submit(uint64_t offset, void* buffer, uint32_t length, uint64_t
         err = "DirectFile: unaligned request";
         return false;
     }
-    const ssize_t got = pread(impl_->fd, buffer, length, (off_t) offset);
-    impl_->done.push_back(Completion{tag, got < 0 ? 0u : (uint32_t) got, got >= 0});
+    {
+        std::lock_guard<std::mutex> lk(impl_->mu);
+        impl_->reqs.push_back(Impl::Req{offset, tag, buffer, length});
+    }
+    impl_->cv_req.notify_one();
     return true;
 }
 
-void DirectFile::wake() {}   // reads complete inside submit; nothing ever blocks in wait
+void DirectFile::wake() {
+    {
+        std::lock_guard<std::mutex> lk(impl_->mu);
+        ++impl_->wakes;
+    }
+    impl_->cv_done.notify_all();
+}
 
-int DirectFile::wait(Completion* out, int max, int) {
+int DirectFile::wait(Completion* out, int max, int timeout_ms) {
+    std::unique_lock<std::mutex> lk(impl_->mu);
+    auto ready = [&] { return !impl_->done.empty() || impl_->wakes > 0; };
+    if (timeout_ms < 0) impl_->cv_done.wait(lk, ready);
+    else if (timeout_ms > 0) impl_->cv_done.wait_for(lk, std::chrono::milliseconds(timeout_ms), ready);
     int n = 0;
+    if (impl_->wakes > 0 && n < max) {
+        --impl_->wakes;
+        out[n++] = Completion{WAKE_TAG, 0, true};
+    }
     while (n < max && !impl_->done.empty()) {
         out[n++] = impl_->done.front();
         impl_->done.pop_front();
