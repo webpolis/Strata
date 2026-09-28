@@ -4,9 +4,8 @@
 # `strata-pack` are added when their sources exist - a target with no sources would make the build graph
 # claim something the tree does not have, which is worse than an absent target.
 #
-# CUDA targets arrive in Phase 2 and this build REJECTS any architecture other than 120: the engine is
-# written against sm_120 (RTX 5000 / Blackwell) and silently building for an older arch would produce a
-# binary that runs and is wrong about its own performance, which is the worst of both outcomes.
+# CUDA targets arrive in Phase 2.  The main engine needs sm_80 or newer; expert tiers on extra GPUs
+# may use sm_75 or newer.
 cmake_minimum_required(VERSION 3.24)
 project(strata VERSION 0.1.16 LANGUAGES CXX)
 add_compile_definitions(STRATA_VERSION="${PROJECT_VERSION}")
@@ -121,7 +120,7 @@ target_link_libraries(strata-plan PRIVATE strata_plan)
 
 # ---- strata_core (CUDA, Phase 2) ------------------------------------------
 # Only built when CUDA is on, so the Phase 1 targets keep working on a machine with no toolkit.  The arch
-# guard above has already refused anything but sm_120 by the time this runs.
+# guard above has already refused main GPU architectures older than sm_80 by the time this runs.
 if(STRATA_ENABLE_CUDA)
   add_library(strata_core STATIC src/core/device.cu src/core/pinned.cu src/platform/memory.cpp src/core/graph.cpp src/core/weights.cpp
                                src/core/layout.cpp)

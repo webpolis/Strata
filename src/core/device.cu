@@ -30,7 +30,7 @@ DeviceInfo device_info(int ordinal) {
     int count = 0;
     check(cudaGetDeviceCount(&count), "cudaGetDeviceCount");
     if (count == 0) {
-        throw CudaError("no CUDA device is present; Strata targets sm_120 (RTX 5000 series)", -1);
+        throw CudaError("no CUDA device is present; Strata needs a main GPU of compute capability 8.0 or newer", -1);
     }
     if (ordinal < 0 || ordinal >= count) {
         throw CudaError("device ordinal " + std::to_string(ordinal) + " is out of range (have " +
@@ -56,13 +56,11 @@ DeviceInfo device_info(int ordinal) {
     check(cudaDriverGetVersion(&d.driver_version), "cudaDriverGetVersion");
     check(cudaRuntimeGetVersion(&d.runtime_version), "cudaRuntimeGetVersion");
 
-    // The engine is written against sm_120.  Compiling for it is enforced by CMake; RUNNING on something else
-    // is caught here, because a binary can be carried to a machine with an older card and would otherwise
-    // silently take whatever path the driver chose.
-    if (d.cc_major != 12) {
+    // The main GPU needs sm_80 or newer.  Extra expert tiers may use sm_75, but this arena is for the main GPU.
+    if (d.cc_major < 8) {
         throw CudaError("device " + d.name + " reports compute capability " + std::to_string(d.cc_major) +
                             "." + std::to_string(d.cc_minor) +
-                            "; Strata targets sm_120 (RTX 5000 series / Blackwell) only",
+                            "; Strata needs a main GPU of compute capability 8.0 or newer",
                         -1);
     }
     return d;
