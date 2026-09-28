@@ -17,8 +17,9 @@ namespace {
 // Makes `dev` current for a scope and puts `home` back, so every entry point leaves the engine's device current.
 struct OnDevice {
     int home;
-    OnDevice(int dev, int home_) : home(home_) { cudaSetDevice(dev); }
-    ~OnDevice() { cudaSetDevice(home); }
+    cudaError_t status;
+    OnDevice(int dev, int home_) : home(home_), status(cudaSetDevice(dev)) {}
+    ~OnDevice() { if (status == cudaSuccess) cudaSetDevice(home); }
 };
 
 size_t align(size_t v, size_t a) { return (v + a - 1) / a * a; }
@@ -30,6 +31,7 @@ GpuTier::~GpuTier() { close(); }
 bool GpuTier::open(int device, int home, int64_t n_layers, int64_t n_expert, int64_t n_embd, int64_t max_tok,
                       int64_t cap, std::string& err) {
     close();
+    if (dev_ >= 0) { err = "the previous GPU tier could not be closed"; return false; }
     const auto& lay = strata::kernels::cpu::expert_layout();
     if (!lay.native) { err = "the second GPU tier needs a native pack (the GGUF's own expert formats)"; return false; }
     int count = 0;
@@ -55,6 +57,10 @@ bool GpuTier::open(int device, int home, int64_t n_layers, int64_t n_expert, int
     const size_t in_bytes = off_x_ + (size_t) (max_tok * n_embd) * sizeof(float);
     const size_t out_bytes = (size_t) (cap * n_embd) * sizeof(float);
     OnDevice on(dev_, home_);
+    if (on.status != cudaSuccess) {
+        err = "cannot select extra GPU " + std::to_string(dev_) + ": " + cudaGetErrorString(on.status);
+        return false;
+    }
     cudaStream_t s = nullptr, as = nullptr;
     cudaEvent_t d = nullptr, ae = nullptr;
     const bool ok = cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking) == cudaSuccess &&
@@ -87,6 +93,10 @@ bool GpuTier::fill(const std::vector<std::pair<int32_t, int32_t>>& ranked, size_
     const auto& lay = strata::kernels::cpu::expert_layout();
     if (first >= ranked.size()) { err = "every ranked expert is already cached"; return false; }
     OnDevice on(dev_, home_);
+    if (on.status != cudaSuccess) {
+        err = "cannot select extra GPU " + std::to_string(dev_) + ": " + cudaGetErrorString(on.status);
+        return false;
+    }
     size_t free_b = 0, total_b = 0;
     if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) { err = "cudaMemGetInfo failed on the second GPU"; return false; }
     const uint64_t room = free_b > ((size_t) reserve_mib << 20) ? free_b - ((size_t) reserve_mib << 20) : 0;
@@ -121,6 +131,7 @@ void GpuTier::close() {
     if (dev_ < 0) return;
     {
         OnDevice on(dev_, home_);
+        if (on.status != cudaSuccess) return;
         cudaDeviceSynchronize();
         cache_.close();
         if (d_in_) cudaFree(d_in_);
@@ -176,14 +187,25 @@ bool GpuTier::launch(const float* x, int64_t n_tok, std::string& err) {
     const auto& f = strata::kernels::cpu::expert_layout().fmt[(size_t) layer_];
     const strata::kernels::NativeExpertLayout L = strata::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
     OnDevice on(dev_, home_);
+    if (on.status != cudaSuccess) {
+        err = "cannot select extra GPU " + std::to_string(dev_) + ": " + cudaGetErrorString(on.status);
+        return false;
+    }
     cudaStream_t s = (cudaStream_t) stream_;
-    cudaMemcpyAsync(d_in_, h_in_, off_x_ + xb, cudaMemcpyHostToDevice, s);
+    if (const cudaError_t e = cudaMemcpyAsync(d_in_, h_in_, off_x_ + xb, cudaMemcpyHostToDevice, s); e != cudaSuccess) {
+        err = std::string("copying to the extra GPU: ") + cudaGetErrorString(e);
+        return false;
+    }
     strata::kernels::quantize_q8_1_rows((const float*) (d_in_ + off_x_), n_tok, n_embd_, d_xq_, s);
     strata::kernels::native_expert_grouped(L, (const unsigned long long*) (d_in_ + off_ptr_),
                                            (const int32_t*) (d_in_ + off_start_), (const int32_t*) d_in_,
                                            (const int32_t*) (d_in_ + off_dst_), (const int32_t*) (d_in_ + off_tok_), ng_,
                                            ne_, d_xq_, d_scratch_, d_out_, s);
-    cudaMemcpyAsync(h_out_, d_out_, (size_t) ne_ * (size_t) n_embd_ * sizeof(float), cudaMemcpyDeviceToHost, s);
+    if (const cudaError_t e = cudaMemcpyAsync(h_out_, d_out_, (size_t) ne_ * (size_t) n_embd_ * sizeof(float),
+                                              cudaMemcpyDeviceToHost, s); e != cudaSuccess) {
+        err = std::string("copying from the extra GPU: ") + cudaGetErrorString(e);
+        return false;
+    }
     const cudaError_t e = cudaEventRecord((cudaEvent_t) done_, s);
     if (e != cudaSuccess) { err = std::string("the extra GPU: ") + cudaGetErrorString(e); return false; }
     launched_ = true;
@@ -197,6 +219,10 @@ bool GpuTier::finish(float* out, std::string& err) {
     cudaError_t e;
     {
         OnDevice on(dev_, home_);
+        if (on.status != cudaSuccess) {
+            err = "cannot select extra GPU " + std::to_string(dev_) + ": " + cudaGetErrorString(on.status);
+            return false;
+        }
         while ((e = cudaEventQuery((cudaEvent_t) done_)) == cudaErrorNotReady) {}
     }
     ms_wait += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
@@ -236,6 +262,10 @@ int GpuTier::adapt(const float* usage, std::vector<uint8_t>& held, ExpertSource&
     if (swaps.empty()) return 0;
     const auto& lay = strata::kernels::cpu::expert_layout();
     OnDevice on(dev_, home_);
+    if (on.status != cudaSuccess) {
+        err = "cannot select extra GPU " + std::to_string(dev_) + ": " + cudaGetErrorString(on.status);
+        return -1;
+    }
     for (const Swap& s : swaps) {
         const size_t in = (size_t) s.layer * n_expert_ + s.in, out = (size_t) s.layer * n_expert_ + s.out;
         const int32_t slot = res_[out];
@@ -250,22 +280,35 @@ int GpuTier::adapt(const float* usage, std::vector<uint8_t>& held, ExpertSource&
         held[in] = 1;
         pending_.emplace_back((int32_t) in, slot);
     }
-    cudaEventRecord((cudaEvent_t) adapt_ev_, (cudaStream_t) adapt_stream_);
+    if (const cudaError_t e = cudaEventRecord((cudaEvent_t) adapt_ev_, (cudaStream_t) adapt_stream_); e != cudaSuccess) {
+        err = std::string("recording the extra GPU refill: ") + cudaGetErrorString(e);
+        return -1;
+    }
     return (int) swaps.size();
 }
 
-void GpuTier::apply(bool wait) {
-    if (pending_.empty()) return;
+bool GpuTier::apply(bool wait, std::string& err) {
+    if (pending_.empty()) return true;
     {
         OnDevice on(dev_, home_);
-        if (wait) cudaEventSynchronize((cudaEvent_t) adapt_ev_);
-        else if (cudaEventQuery((cudaEvent_t) adapt_ev_) != cudaSuccess) return;
+        if (on.status != cudaSuccess) {
+            err = "cannot select extra GPU " + std::to_string(dev_) + ": " + cudaGetErrorString(on.status);
+            return false;
+        }
+        const cudaError_t e = wait ? cudaEventSynchronize((cudaEvent_t) adapt_ev_)
+                                   : cudaEventQuery((cudaEvent_t) adapt_ev_);
+        if (e == cudaErrorNotReady) return true;
+        if (e != cudaSuccess) {
+            err = std::string("finishing the extra GPU refill: ") + cudaGetErrorString(e);
+            return false;
+        }
     }
     for (const auto& [i, slot] : pending_) {
         res_[(size_t) i] = slot;
         incoming_[(size_t) i] = 0;
     }
     pending_.clear();
+    return true;
 }
 
 int tier_of(const std::vector<GpuTier*>& tiers, int64_t layer, int32_t e) {

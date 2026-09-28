@@ -218,6 +218,7 @@ struct Options {
     /// the VRAM each leaves free (the last value repeats).
     std::vector<int64_t> extra_gpus;
     std::vector<int64_t> extra_gpu_reserve_mib = {256};
+    bool extra_gpus_optional = false;
     /// Plan v0.3 P5: batched prompt processing in chunks of this many tokens (0 = the token path).
     int64_t prefill_chunk = 0;
     /// `--prefill auto`: the largest chunk (up to 8192) whose buffers the expert cache can lend.  Every expert a chunk
@@ -400,6 +401,7 @@ void usage() {
                  "                       the CPU (native packs, with --expert-profile).\n"
                  "  --extra-gpu-reserve-mib LIST  MiB each extra GPU leaves free (default 256; the last value\n"
                  "                       repeats).\n"
+                 "  --extra-gpus-optional  Skip a listed extra GPU if it cannot start or hold an expert.\n"
                  "  --expert-cache-per-layer  R4.2g: give each layer its OWN slots instead of letting the first\n"
                  "                       position take all of them.  The default policy fills in arrival order\n"
                  "                       from one shared counter, so 256 slots went to ~26 layers of position 0\n"
@@ -871,6 +873,7 @@ int main(int argc, char** argv) {
             o.expert_cache = (v == "auto") ? -1 : std::atoi(v.c_str());
         }
         else if (a == "--vram-reserve-mib") o.vram_reserve_mib = std::atoi(next("--vram-reserve-mib"));
+        else if (a == "--extra-gpus-optional") o.extra_gpus_optional = true;
         else if (a == "--extra-gpus" || a == "--extra-gpu-reserve-mib") {
             std::vector<int64_t>& dst = a == "--extra-gpus" ? o.extra_gpus : o.extra_gpu_reserve_mib;
             std::string e;
@@ -1630,7 +1633,10 @@ int main(int argc, char** argv) {
             return 2;
         }
         int home = 0;
-        cudaGetDevice(&home);
+        if (const cudaError_t e = cudaGetDevice(&home); e != cudaSuccess) {
+            std::fprintf(stderr, "strata generate: cannot identify the main GPU: %s\n", cudaGetErrorString(e));
+            return 1;
+        }
         size_t next = (size_t) prefilled;
         for (size_t i = 0; i < o.extra_gpus.size(); ++i) {
             const int dev = (int) o.extra_gpus[i];
@@ -1642,8 +1648,13 @@ int main(int argc, char** argv) {
             auto t = std::make_unique<strata::core::GpuTier>();
             if (!t->open(dev, home, g.n_layers, g.n_expert, g.n_embd, strata::kernels::cpu::MAXT, 128, err) ||
                 !t->fill(profile, next, *srcp, reserve, err)) {
-                std::fprintf(stderr, "strata generate: extra GPU %d: %s\n", dev, err.c_str());
-                return 1;
+                if (!o.extra_gpus_optional) {
+                    std::fprintf(stderr, "strata generate: extra GPU %d: %s\n", dev, err.c_str());
+                    return 1;
+                }
+                std::fprintf(stderr, "strata generate: skipping extra GPU %d: %s\n", dev, err.c_str());
+                err.clear();
+                continue;
             }
             cudaDeviceProp prop{};
             cudaGetDeviceProperties(&prop, dev);
@@ -2481,15 +2492,17 @@ int main(int argc, char** argv) {
         std::vector<std::pair<int32_t, int32_t>> pending;
         cudaEvent_t adapt_ev = nullptr;
         cudaEventCreateWithFlags(&adapt_ev, cudaEventDisableTiming);
-        auto apply_pending = [&](bool wait) {
-            for (const auto& t : tiers) t->apply(wait);
-            if (pending.empty()) return;
+        auto apply_pending = [&](bool wait) -> bool {
+            for (const auto& t : tiers)
+                if (!t->apply(wait, err)) return false;
+            if (pending.empty()) return true;
             if (wait) cudaEventSynchronize(adapt_ev);
-            else if (cudaEventQuery(adapt_ev) != cudaSuccess) return;
+            else if (cudaEventQuery(adapt_ev) != cudaSuccess) return true;
             for (const auto& [i, slot] : pending) host_res[(size_t) i] = slot;
             pending.clear();
             if (d_res != nullptr)
                 cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
+            return true;
         };
         // the VRAM tier follows the conversation (the same rule as the speculative loop below)
         auto adapt = [&]() -> bool {
@@ -2989,7 +3002,10 @@ int main(int argc, char** argv) {
                 lent_chunk = want;
                 return true;
             };
-            apply_pending(true);
+            if (!apply_pending(true)) {
+                std::printf("ERR %s\n", err.c_str());
+                return 1;
+            }
             // per-request sampling for the verify window's head (greedy when temperature is absent)
             strata::kernels::SamplerParams req_sp;
             req_sp.greedy = req_temperature <= 0.0f;
@@ -3107,7 +3123,10 @@ int main(int argc, char** argv) {
                 drive.d.layers = 0;
                 drive.d.experts = 0;
                 drive.d.failed = false;
-                apply_pending(false);
+                if (!apply_pending(false)) {
+                    std::printf("ERR %s\n", err.c_str());
+                    return 1;
+                }
                 if (hist_n > 0) {
                     // the tail the penalties count over: the tokens the state has consumed plus the fed-back
                     // head `x` (it joins `consumed` only after this window commits).  Most recent LAST,
@@ -3677,15 +3696,17 @@ int main(int argc, char** argv) {
         std::vector<std::pair<int32_t, int32_t>> pending;
         cudaEvent_t adapt_ev = nullptr;
         cudaEventCreateWithFlags(&adapt_ev, cudaEventDisableTiming);
-        auto apply_pending = [&](bool wait) {
-            for (const auto& t : tiers) t->apply(wait);
-            if (pending.empty()) return;
+        auto apply_pending = [&](bool wait) -> bool {
+            for (const auto& t : tiers)
+                if (!t->apply(wait, err)) return false;
+            if (pending.empty()) return true;
             if (wait) cudaEventSynchronize(adapt_ev);
-            else if (cudaEventQuery(adapt_ev) != cudaSuccess) return;
+            else if (cudaEventQuery(adapt_ev) != cudaSuccess) return true;
             for (const auto& [i, slot] : pending) host_res[(size_t) i] = slot;
             pending.clear();
             if (d_res != nullptr)
                 cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
+            return true;
         };
         // Plan v0.3 P6: the VRAM tier follows the conversation.  Candidates are missing experts routed at least
         // twice (decayed); each is paired with its layer's least-routed resident expert and swapped when it was
@@ -3807,7 +3828,10 @@ int main(int argc, char** argv) {
             drive.d.layers = 0;
             drive.d.experts = 0;
             drive.d.failed = false;
-            apply_pending(false);
+            if (!apply_pending(false)) {
+                std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+                return 1;
+            }
             if (!ver.run(T, window.data(), p, &drive_pool_multi, &drive, outv.data(), err)) {
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
                 return 1;

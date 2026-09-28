@@ -59,7 +59,7 @@ public:
     /// the evicted experts leave at once, the new ones arrive in `apply`.  Returns the swaps started, -1 on failure.
     int adapt(const float* usage, std::vector<uint8_t>& held, ExpertSource& src, int max_swaps, std::string& err);
     /// Admits the swapped-in experts once their copies have landed (`wait`: block until they have).
-    void apply(bool wait);
+    bool apply(bool wait, std::string& err);
 
     int64_t entries = 0;    ///< routed entries this card computed
     double ms_wait = 0;     ///< host time spent waiting for the card after the CPU's share
