@@ -255,8 +255,11 @@ def gpus():
 
 
 def gpu_info():
-    """The GPU the engine runs on: the one with the most VRAM, then the newest."""
-    return max(gpus(), key=lambda g: (g["vram_gb"], int(g["arch"])), default=None)
+    """The GPU the engine runs on: the one with the most VRAM, then the newest, among those the engine supports
+    (compute capability 8.0+); with none of those, the best one anyway, so the check below names it."""
+    found = gpus()
+    usable = [g for g in found if int(g["arch"]) >= 80] or found
+    return max(usable, key=lambda g: (g["vram_gb"], int(g["arch"])), default=None)
 
 
 def second_gpu(main):
