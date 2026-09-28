@@ -1,10 +1,10 @@
-// include/strata/core/second_tier.hpp - a second GPU as one more expert tier.
+// include/strata/core/gpu_tier.hpp - extra GPUs as more expert tiers.
 //
-// The main card's cache holds the most-routed experts; this card holds the ones ranked next, which the CPU would
-// otherwise compute.  Per layer of a verify window the host copies the window's activations to the card, the card
-// computes its resident experts with the main card's own kernels (quantize_q8_1_rows + native_expert_grouped), and
-// the rows come back into the CPU's mapped rows before the host raises the layer's flag - so the main card's graph
-// is unchanged.  Native packs only.
+// The main card's cache holds the most-routed experts; each extra card holds the ones ranked next, which the CPU
+// would otherwise compute.  Per layer of a verify window the host copies the window's activations to each card
+// that holds a routed expert, the card computes them with the main card's own kernels (quantize_q8_1_rows +
+// native_expert_grouped), and the rows come back into the CPU's mapped rows before the host raises the layer's
+// flag - so the main card's graph is unchanged.  Native packs only.
 #pragma once
 
 #include "strata/core/expert_cache.hpp"
@@ -18,12 +18,12 @@ namespace strata::core {
 
 class ExpertSource;
 
-class SecondTier {
+class GpuTier {
 public:
-    SecondTier() = default;
-    ~SecondTier();
-    SecondTier(const SecondTier&) = delete;
-    SecondTier& operator=(const SecondTier&) = delete;
+    GpuTier() = default;
+    ~GpuTier();
+    GpuTier(const GpuTier&) = delete;
+    GpuTier& operator=(const GpuTier&) = delete;
 
     /// Streams and buffers on CUDA device `device` for up to `max_tok` tokens and `cap` routed entries per layer.
     /// `home` is the engine's device; it is current again whenever a call returns.
@@ -35,34 +35,29 @@ public:
               std::string& err);
     void close();
 
-    bool on() const { return cache_.valid(); }
     int device() const { return dev_; }
     int64_t slots() const { return cache_.slots(); }
     int64_t bytes() const { return cache_.bytes(); }
     int32_t slot_of(int64_t layer, int32_t e) const { return res_[(size_t) (layer * n_expert_ + e)]; }
     /// Resident here, or on its way in (an adaptive swap still copying).
-    bool holds(int64_t layer, int32_t e) const {
-        const size_t i = (size_t) (layer * n_expert_ + e);
-        return res_[i] >= 0 || incoming_[i];
-    }
+    bool holds(int64_t layer, int32_t e) const { return holds_at((size_t) (layer * n_expert_ + e)); }
+    bool holds_at(size_t i) const { return res_[i] >= 0 || incoming_[i]; }
 
     // ---- one layer of a verify window, driven by the pool dispatch
     void begin(int64_t layer);
     void add_group(int32_t expert);
     void add_entry(int32_t routed, int32_t tok);
-    int groups() const { return ng_; }
     /// Copies the plan and `n_tok` activation rows (host) to the card, computes the groups, copies the rows back.
-    /// Returns at once.
+    /// Returns at once; does nothing when the layer routed nothing here.
     bool launch(const float* x, int64_t n_tok, std::string& err);
     /// Waits for the card and writes each entry's row into `out` at its routed index.
     bool finish(float* out, std::string& err);
 
-    // ---- the adaptive tier: the same rule as the main card's, over the experts neither card holds
-    /// Swaps up to `max_swaps` of the most-routed experts that are on neither card (and not arriving on the main
-    /// card: `main_res`, `main_incoming`) in place of this card's least-routed ones.  Copies start on the card's
-    /// own stream; the evicted experts leave at once, the new ones arrive in `apply`.  Returns the swaps started.
-    int adapt(const float* usage, const int32_t* main_res, const std::vector<std::pair<int32_t, int32_t>>& main_incoming,
-              ExpertSource& src, int max_swaps, std::string& err);
+    // ---- the adaptive tier: the main card's rule, over the experts no card holds
+    /// Swaps up to `max_swaps` of the most-routed experts not in `held` (resident or arriving on any card) in place
+    /// of this card's least-routed ones, and marks the new ones in `held`.  Copies start on the card's own stream;
+    /// the evicted experts leave at once, the new ones arrive in `apply`.  Returns the swaps started, -1 on failure.
+    int adapt(const float* usage, std::vector<uint8_t>& held, ExpertSource& src, int max_swaps, std::string& err);
     /// Admits the swapped-in experts once their copies have landed (`wait`: block until they have).
     void apply(bool wait);
 
@@ -94,5 +89,15 @@ private:
     int ng_ = 0, ne_ = 0;
     bool launched_ = false;
 };
+
+/// The first tier holding `(layer, e)` resident, or -1.
+int tier_of(const std::vector<GpuTier*>& tiers, int64_t layer, int32_t e);
+/// Resident or arriving on any tier (the main card's adaptive candidates skip these).
+bool held_by_tier(const std::vector<GpuTier*>& tiers, int64_t layer, int32_t e);
+/// Every tier's adaptive swaps for one round, after the main card's (`main_res`, `main_incoming`): no expert ends
+/// up cached twice.  False on a failed copy.
+bool adapt_tiers(const std::vector<GpuTier*>& tiers, const float* usage, const std::vector<int32_t>& main_res,
+                 const std::vector<std::pair<int32_t, int32_t>>& main_incoming, ExpertSource& src, int max_swaps,
+                 std::string& err);
 
 }  // namespace strata::core

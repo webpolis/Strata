@@ -262,10 +262,15 @@ def gpu_info():
     return max(usable, key=lambda g: (g["vram_gb"], int(g["arch"])), default=None)
 
 
-def second_gpu(main):
-    """Another GPU that can hold experts beside the main one (RTX 20 or newer, 4 GB or more), the biggest; or None."""
+def extra_gpus(main):
+    """Every other GPU that can hold experts beside the main one (RTX 20 or newer, 4 GB or more), biggest first."""
     rest = [g for g in gpus() if g["uuid"] != main["uuid"] and int(g["arch"]) >= 75 and g["vram_gb"] >= 4]
-    return max(rest, key=lambda g: (g["vram_gb"], int(g["arch"])), default=None)
+    return sorted(rest, key=lambda g: (g["vram_gb"], int(g["arch"])), reverse=True)
+
+
+def extra_archs(main, extras):
+    """The archs the expert kernels need besides the main GPU's."""
+    return sorted({g["arch"] for g in extras} - {main["arch"]})
 
 
 def find_nvcc():
@@ -527,7 +532,7 @@ def update_installed_engine(url_base) -> None:
         try:                                           # a failed compile must not stop the model from starting
             if gpu is None:
                 raise RuntimeError("no NVIDIA GPU found")
-            build_engine(gpu, vision, False, get_llama_cpp(), meta.get("second_arch"))
+            build_engine(gpu, vision, False, get_llama_cpp(), meta.get("extra_archs") or [])
         except (Exception, SystemExit) as e:
             warn(f"could not compile the updated engine{'' if isinstance(e, SystemExit) else f' ({e})'}: starting the installed one")
         return
@@ -644,9 +649,9 @@ def source_hash(parts) -> str:
     return h.hexdigest()[:16]
 
 
-def build_engine(gpu, vision, yes, llama, arch2=None) -> Path:
-    """Compile the engine (and, for images, the encoder) for this GPU, and its expert kernels for a second GPU's
-    `arch2` too; the results go to engine/.  A compiled engine whose source files changed since (a `git pull`) is
+def build_engine(gpu, vision, yes, llama, archs2=()) -> Path:
+    """Compile the engine (and, for images, the encoder) for this GPU, and its expert kernels for the extra GPUs'
+    `archs2` too; the results go to engine/.  A compiled engine whose source files changed since (a `git pull`) is
     compiled again: only the changed files, a few minutes."""
     eng = ROOT / "engine"
     eng.mkdir(exist_ok=True)
@@ -655,7 +660,7 @@ def build_engine(gpu, vision, yes, llama, arch2=None) -> Path:
     want_vision = vision != "none"
     local = meta.get("source") == "local"
     src, vsrc = source_hash(ENGINE_SOURCES), source_hash(VISION_SOURCES)
-    engine_ok = local and (eng / EXE).exists() and meta.get("src") == src and meta.get("second_arch") == arch2
+    engine_ok = local and (eng / EXE).exists() and meta.get("src") == src and meta.get("extra_archs", []) == list(archs2)
     vision_ok = not want_vision or ((eng / VEXE).exists() and (not local or meta.get("vision_src") == vsrc))
     if engine_ok and vision_ok:
         ok("engine already built for this PC")
@@ -667,7 +672,7 @@ def build_engine(gpu, vision, yes, llama, arch2=None) -> Path:
         cmake_build(ROOT, ROOT / "build", "strata",
                     ["-DSTRATA_ENABLE_CUDA=ON", "-DSTRATA_BUILD_TESTS=OFF", f"-DCMAKE_CUDA_ARCHITECTURES={gpu['arch']}",
                      f"-DCMAKE_CUDA_COMPILER={nvcc}", f"-DSTRATA_GGML_DIR={llama}",
-                     f"-DSTRATA_SECOND_GPU_ARCH={arch2 or ''}"], vcvars, "build-strata.bat")
+                     f"-DSTRATA_EXTRA_GPU_ARCHS={';'.join(archs2)}"], vcvars, "build-strata.bat")
         shutil.copy2(ROOT / "build" / EXE, eng / EXE)
     if not vision_ok:
         say("  Compiling the image encoder" + (" with CUDA (10-20 minutes, once) ..." if vision == "gpu" else " ..."))
@@ -679,7 +684,7 @@ def build_engine(gpu, vision, yes, llama, arch2=None) -> Path:
     bindir = Path(nvcc).parent                            # the toolkit's own libraries (bin, bin/x64, lib64)
     dirs = [str(d) for d in (bindir, bindir / "x64", bindir.parent / "lib64") if d.is_dir()]
     stamp.write_text(json.dumps({"source": "local", "version": source_version(), "archs": [int(gpu["arch"])],
-                                 "second_arch": arch2, "vision": vision,
+                                 "extra_archs": list(archs2), "vision": vision,
                                  "cuda_dirs": dirs, "src": src, "vision_src": vsrc if want_vision else None}, indent=1))
     ok(f"engine compiled: {eng / EXE}")
     return eng
@@ -1011,8 +1016,8 @@ def main() -> int:
     ap.add_argument("--prebuilt", default=os.environ.get("STRATA_PREBUILT_URL", PREBUILT_URL),
                     help="where the ready-made engine is (a URL folder or a local folder)")
     ap.add_argument("--check", action="store_true", help="only check this PC and exit")
-    ap.add_argument("--second-gpu", choices=["auto", "off"], default="auto",
-                    help="use another GPU (RTX 20 or newer) as a second expert cache (auto: when there is one)")
+    ap.add_argument("--extra-gpus", choices=["auto", "off"], default="auto",
+                    help="use the other GPUs (RTX 20 or newer) as more expert caches (auto: every one there is)")
     ap.add_argument("--skip-build", action="store_true", help=argparse.SUPPRESS)
     a = ap.parse_args()
     say("Strata - Qwen3.8-Flash-Next on a normal PC (NVIDIA GPU + system RAM + CPU)")
@@ -1066,9 +1071,9 @@ def main() -> int:
         warn(f"driver {gpu['driver']}: the ready-made engine needs {MIN_DRIVER} or newer, so it is compiled here "
              "with the CUDA toolkit you have")
         a.build = True
-    gpu2 = second_gpu(gpu) if a.second_gpu == "auto" else None
-    if gpu2 is not None:
-        ok(f"second GPU: {gpu2['name']}, {gpu2['vram_gb']:.1f} GB VRAM - a second expert cache")
+    extras = extra_gpus(gpu) if a.extra_gpus == "auto" else []
+    for g in extras:
+        ok(f"extra GPU: {g['name']}, {g['vram_gb']:.1f} GB VRAM - another expert cache")
     if gpu["vram_gb"] < 11:
         warn("less than 12 GB of VRAM: Strata will run, but most experts stay on the CPU and it will be slow")
     ram = ram_gb()
@@ -1120,11 +1125,11 @@ def main() -> int:
         fail(f"{model} needs about {MODELS[model]['ram_gb']} GB of RAM; this PC has {ram:.0f} GB",
              "choose Q2_0 or IQ2_XS, or add RAM")
     ok(f"size: {model}")
-    if gpu2 is not None and model == "Q2_0" and avx512 and family == "qwen":
-        warn("the AVX-512 Q2_0 pack has no second-GPU tier: using one GPU")
-        gpu2 = None
-    if gpu2 is not None:
-        a.build = True                                 # the ready-made engine has no kernels for it
+    if extras and model == "Q2_0" and avx512 and family == "qwen":
+        warn("the AVX-512 Q2_0 pack has no extra-GPU tiers: using one GPU")
+        extras = []
+    if extras:
+        a.build = True                                 # the ready-made engine has no extra-GPU tiers
     tag = fam["tag"] + model                           # names of the pack, config and start script
     rec_ctx = 32768 if gpu["vram_gb"] < 14 else 65536 if gpu["vram_gb"] < 20 else 131072
     if a.context:
@@ -1209,7 +1214,7 @@ def main() -> int:
             warn("the ready-made engine has no image encoder: compiling it")
             eng = None
     if eng is None:
-        eng = build_engine(gpu, vision, a.yes, llama, gpu2["arch"] if gpu2 else None)
+        eng = build_engine(gpu, vision, a.yes, llama, extra_archs(gpu, extras))
     meta = json.loads((eng / "BUILD.json").read_text())
     lib_dirs = meta.get("cuda_dirs") or cuda_lib_dirs()
     ok(f"engine: {eng / EXE}")
@@ -1303,8 +1308,8 @@ def main() -> int:
         ok(f"KV streaming on: the context's KV cache lives in RAM ({kv_ram_gb:.1f} GB), more experts fit in VRAM")
     if vision != "none":
         args += ["--vision", "--vram-reserve-mib", str(VISION[vision]["reserve_mib"])]
-    if gpu2 is not None:
-        args += ["--second-gpu", "1"]
+    if extras:
+        args += ["--extra-gpus", ",".join(str(i) for i in range(1, len(extras) + 1))]
     if esp is not None:
         # the package's profile, with llama.cpp's flags (the engine takes the same ones)
         args += ["--control-vector-scaled", f"{esp}:1.0", "--control-vector-layer-range", "4", "44",
@@ -1312,8 +1317,8 @@ def main() -> int:
     cfg = {"exe": str(eng / EXE), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
            "model_name": f"{fam['name']}-{model.lower()}", "log": str(ROOT / f"strata-{tag.lower()}.log"),
            "lib_dirs": lib_dirs, "port": port}
-    if len(gpus()) > 1:                                # the main GPU is CUDA device 0, the second one device 1
-        cfg["env"] = {"CUDA_VISIBLE_DEVICES": ",".join(g["uuid"] for g in (gpu, gpu2) if g)}
+    if len(gpus()) > 1:                                # the main GPU is CUDA device 0, the extra ones 1, 2, ...
+        cfg["env"] = {"CUDA_VISIBLE_DEVICES": ",".join(g["uuid"] for g in [gpu, *extras])}
     if a.host:
         cfg["host"] = a.host
     if a.api_key:

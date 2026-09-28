@@ -31,7 +31,7 @@
 
 namespace strata::core {
 
-class SecondTier;
+class GpuTier;
 
 /// Where one routed expert's bytes come from.
 ///
@@ -206,9 +206,9 @@ struct ExpertDispatch {
     /// Plan v0.3 P6: the verify window's GPU plan (VRAM hits + the PCIe share of the misses); `pcie_num`/256 of
     /// each layer's distinct missed experts (the last ones in routing order) are read by the GPU over PCIe.
     GpuPlanSink* plan = nullptr;
-    /// A second GPU holding the experts ranked after the VRAM tier (null = none): its resident experts are
-    /// computed there instead of on the CPU or over PCIe.
-    SecondTier* tier2 = nullptr;
+    /// Extra GPUs holding the experts ranked after the VRAM tier, in order: their resident experts are computed
+    /// there instead of on the CPU or over PCIe.
+    std::vector<GpuTier*> tiers;
     int pcie_num = 0;
     int64_t pcie_experts = 0;      ///< distinct experts the GPU read over PCIe in verify windows
     double ms_plan = 0, ms_actq = 0, ms_jobs = 0, ms_run = 0;   ///< verify-window dispatch sections

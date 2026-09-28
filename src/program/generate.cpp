@@ -18,7 +18,7 @@
 #include "strata/core/expert_source.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/layout.hpp"
-#include "strata/core/second_tier.hpp"
+#include "strata/core/gpu_tier.hpp"
 #include "strata/core/session.hpp"
 #include "strata/core/weights.hpp"
 #include "strata/kernels/cpu/expert.hpp"
@@ -69,6 +69,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <charconv>
 #include <cmath>
@@ -213,10 +214,10 @@ struct Options {
     /// Plan v0.3 P4: `--expert-cache auto` sizes the VRAM tier from what is free after the weights, the session
     /// and the KV state, minus this reserve for the graphs, the hit scratch and the head.
     int vram_reserve_mib = 700;
-    /// A second CUDA device used as one more expert tier (the experts ranked after the main card's cache), and the
-    /// VRAM it leaves free.  -1 = off.
-    int second_gpu = -1;
-    int second_gpu_reserve_mib = 256;
+    /// Extra CUDA devices used as more expert tiers (each holds the experts ranked after the cards before it), and
+    /// the VRAM each leaves free (the last value repeats).
+    std::vector<int64_t> extra_gpus;
+    std::vector<int64_t> extra_gpu_reserve_mib = {256};
     /// Plan v0.3 P5: batched prompt processing in chunks of this many tokens (0 = the token path).
     int64_t prefill_chunk = 0;
     /// `--prefill auto`: the largest chunk (up to 8192) whose buffers the expert cache can lend.  Every expert a chunk
@@ -394,10 +395,11 @@ void usage() {
                  "                       GPU via `moe_hit_grouped_s2`.  DEFAULT 0.  Measured at 4096 slots\n"
                  "                       with --expert-cache-per-layer: 54.4%% hits, CPU pool drain 19.1 -> 10.3\n"
                  "                       ms/token, -2.7 ms/token end to end.\n"
-                 "  --second-gpu N       Use CUDA device N as a second expert tier: it holds the experts ranked\n"
-                 "                       after the main card's cache and computes them instead of the CPU\n"
-                 "                       (native packs, with --expert-profile).  --second-gpu-reserve-mib M\n"
-                 "                       leaves M MiB of it free (default 256).\n"
+                 "  --extra-gpus LIST    Use these CUDA devices (e.g. 1,2) as more expert tiers: each holds the\n"
+                 "                       experts ranked after the cards before it and computes them instead of\n"
+                 "                       the CPU (native packs, with --expert-profile).\n"
+                 "  --extra-gpu-reserve-mib LIST  MiB each extra GPU leaves free (default 256; the last value\n"
+                 "                       repeats).\n"
                  "  --expert-cache-per-layer  R4.2g: give each layer its OWN slots instead of letting the first\n"
                  "                       position take all of them.  The default policy fills in arrival order\n"
                  "                       from one shared counter, so 256 slots went to ~26 layers of position 0\n"
@@ -869,8 +871,14 @@ int main(int argc, char** argv) {
             o.expert_cache = (v == "auto") ? -1 : std::atoi(v.c_str());
         }
         else if (a == "--vram-reserve-mib") o.vram_reserve_mib = std::atoi(next("--vram-reserve-mib"));
-        else if (a == "--second-gpu") o.second_gpu = std::atoi(next("--second-gpu"));
-        else if (a == "--second-gpu-reserve-mib") o.second_gpu_reserve_mib = std::atoi(next("--second-gpu-reserve-mib"));
+        else if (a == "--extra-gpus" || a == "--extra-gpu-reserve-mib") {
+            std::vector<int64_t>& dst = a == "--extra-gpus" ? o.extra_gpus : o.extra_gpu_reserve_mib;
+            std::string e;
+            if (!parse_i64_list(next(a.c_str()), dst, e) || dst.empty()) {
+                std::fprintf(stderr, "%s: %s\n", a.c_str(), e.empty() ? "empty list" : e.c_str());
+                return 2;
+            }
+        }
         else if (a == "--prefill") {
             const std::string v = next("--prefill");
             o.prefill_auto = v == "auto";
@@ -1613,30 +1621,47 @@ int main(int argc, char** argv) {
                      (long long) prefilled, (long long) want);
     }
 
-    // ---- the second GPU: the experts ranked after the ones the main card took, computed there instead of the CPU
-    strata::core::SecondTier tier2;
-    if (o.second_gpu >= 0) {
+    // ---- the extra GPUs: each takes the experts ranked after the ones the cards before it took, and computes them
+    // instead of the CPU
+    std::vector<std::unique_ptr<strata::core::GpuTier>> tiers;
+    if (!o.extra_gpus.empty()) {
         if (!native_pack || profile.empty() || prefilled == 0 || srcp == nullptr) {
-            std::fprintf(stderr, "strata generate: --second-gpu needs a native pack, --expert-profile and the VRAM tier\n");
+            std::fprintf(stderr, "strata generate: --extra-gpus needs a native pack, --expert-profile and the VRAM tier\n");
             return 2;
         }
         int home = 0;
         cudaGetDevice(&home);
-        cudaDeviceProp prop{};
-        cudaGetDeviceProperties(&prop, o.second_gpu);
-        if (!tier2.open(o.second_gpu, home, g.n_layers, g.n_expert, g.n_embd, strata::kernels::cpu::MAXT, 128, err) ||
-            !tier2.fill(profile, (size_t) prefilled, *srcp, o.second_gpu_reserve_mib, err)) {
-            std::fprintf(stderr, "strata generate: second GPU %d: %s\n", o.second_gpu, err.c_str());
-            return 1;
+        size_t next = (size_t) prefilled;
+        for (size_t i = 0; i < o.extra_gpus.size(); ++i) {
+            const int dev = (int) o.extra_gpus[i];
+            if (next >= profile.size()) {
+                std::fprintf(stderr, "strata generate: every expert is already cached; GPU %d stays unused\n", dev);
+                continue;
+            }
+            const int reserve = (int) o.extra_gpu_reserve_mib[std::min(i, o.extra_gpu_reserve_mib.size() - 1)];
+            auto t = std::make_unique<strata::core::GpuTier>();
+            if (!t->open(dev, home, g.n_layers, g.n_expert, g.n_embd, strata::kernels::cpu::MAXT, 128, err) ||
+                !t->fill(profile, next, *srcp, reserve, err)) {
+                std::fprintf(stderr, "strata generate: extra GPU %d: %s\n", dev, err.c_str());
+                return 1;
+            }
+            cudaDeviceProp prop{};
+            cudaGetDeviceProperties(&prop, dev);
+            std::fprintf(stderr, "strata generate: extra GPU %d (%s): %lld more experts, %.2f GiB (profile ranks %lld..%lld); "
+                                 "slot 0 verified\n", dev, prop.name, (long long) t->slots(),
+                         (double) t->bytes() / 1073741824.0, (long long) next, (long long) (next + t->slots() - 1));
+            next += (size_t) t->slots();
+            tiers.push_back(std::move(t));
         }
-        std::fprintf(stderr, "strata generate: second GPU %d (%s): %lld more experts, %.2f GiB (profile ranks %lld..%lld); "
-                             "slot 0 verified\n", o.second_gpu, prop.name, (long long) tier2.slots(),
-                     (double) tier2.bytes() / 1073741824.0, (long long) prefilled,
-                     (long long) (prefilled + tier2.slots() - 1));
+    }
+    int64_t tier_slots = 0, tier_bytes = 0;
+    for (const auto& t : tiers) {
+        tier_slots += t->slots();
+        tier_bytes += t->bytes();
     }
 
     Drive drive;
-    if (tier2.on()) drive.d.tier2 = &tier2;
+    for (const auto& t : tiers) drive.d.tiers.push_back(t.get());
     drive.d.hit_cpu_order = o.expert_cache_cpu_order;
     drive.d.split_rows = !o.no_split_rows;
     drive.d.pool = &pool;
@@ -2457,7 +2482,7 @@ int main(int argc, char** argv) {
         cudaEvent_t adapt_ev = nullptr;
         cudaEventCreateWithFlags(&adapt_ev, cudaEventDisableTiming);
         auto apply_pending = [&](bool wait) {
-            tier2.apply(wait);
+            for (const auto& t : tiers) t->apply(wait);
             if (pending.empty()) return;
             if (wait) cudaEventSynchronize(adapt_ev);
             else if (cudaEventQuery(adapt_ev) != cudaSuccess) return;
@@ -2478,7 +2503,7 @@ int main(int argc, char** argv) {
                 const float* u = drive.d.usage.data() + l * g.n_expert;
                 const int32_t* r = host_res.data() + l * g.n_expert;
                 for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
-                    if (r[e] < 0) { if (u[e] >= 2.0f && !(tier2.on() && tier2.holds(l, e))) cand.emplace_back(u[e], e); }
+                    if (r[e] < 0) { if (u[e] >= 2.0f && !strata::core::held_by_tier(drive.d.tiers, l, e)) cand.emplace_back(u[e], e); }
                     else vict.emplace_back(u[e], e);
                 }
                 if (cand.empty() || vict.empty()) continue;
@@ -2505,9 +2530,9 @@ int main(int argc, char** argv) {
                 pending.emplace_back((int32_t) in, slot);      // resident once the copy has landed
             }
             if (!swaps.empty()) cudaEventRecord(adapt_ev, adapt_stream);
-            if (tier2.on()) {
+            {
                 std::string e2;
-                if (tier2.adapt(drive.d.usage.data(), host_res.data(), pending, *srcp, o.adapt_swaps, e2) < 0) {
+                if (!strata::core::adapt_tiers(drive.d.tiers, drive.d.usage.data(), host_res, pending, *srcp, o.adapt_swaps, e2)) {
                     std::fprintf(stderr, "strata: %s\n", e2.c_str());
                     return false;
                 }
@@ -2603,8 +2628,8 @@ int main(int argc, char** argv) {
                         (long long) o.max_context, o.kv.c_str(),
                         (long long) (g.n_qsa_layers() > 0 && ss.qsa_states[0].kv_mode == 1
                                          ? ss.qsa_states[0].n_slots * 4 : 0),
-                        (long long) (xcache.slots() + tier2.slots()),   // both cards' experts
-                        (long long) ((xcache.bytes() + (tier2.on() ? tier2.bytes() : 0)) >> 20), o.spec, o.mtp_max_t,
+                        (long long) (xcache.slots() + tier_slots),   // every card's experts
+                        (long long) ((xcache.bytes() + tier_bytes) >> 20), o.spec, o.mtp_max_t,
                         o.suffix_draft, (long long) (free_b >> 20), cvec_summary.c_str(),
                         (long long) (strata::kernels::cpu::expert_layout().total >> 20));
         }
@@ -3244,11 +3269,20 @@ int main(int argc, char** argv) {
                          prompt_ms > 0 ? 1000.0 * fresh / prompt_ms : 0.0, (long long) produced_n, decode_ms,
                          decode_ms > 0 ? 1000.0 * produced_n / decode_ms : 0.0, (long long) draft_accepted,
                          (long long) draft_offered, checks.size(), cancelled ? " (cancelled)" : "");
-            if (tier2.on())   // cumulative over the process: routed entries by where they were computed
-                std::fprintf(stderr, "strata serve: experts: %lld on the main GPU's cache, %lld on the second GPU, %lld on "
-                                     "the CPU (the rest read over PCIe); waited %.0f ms for the second GPU\n",
-                             (long long) drive.d.cache_hits, (long long) tier2.entries, (long long) drive.d.multi_entries,
-                             tier2.ms_wait);
+            if (!tiers.empty()) {   // cumulative over the process: routed entries by where they were computed
+                std::string per;
+                int64_t on_tiers = 0;
+                double waited = 0;
+                for (const auto& t : tiers) {
+                    per += (per.empty() ? "" : ", ") + std::to_string(t->entries) + " on GPU " + std::to_string(t->device());
+                    on_tiers += t->entries;
+                    waited += t->ms_wait;
+                }
+                std::fprintf(stderr, "strata serve: experts: %lld on the main GPU's cache, %lld on the extra GPUs (%s), %lld "
+                                     "on the CPU (the rest read over PCIe); waited %.0f ms for the extra GPUs\n",
+                             (long long) drive.d.cache_hits, (long long) on_tiers, per.c_str(),
+                             (long long) drive.d.multi_entries, waited);
+            }
             if (g.n_qsa_layers() > 0 && ss.qsa_states[0].kv_mode == 1) {
                 // KV streaming, cumulative over the process: blocks the selections named vs blocks read from RAM
                 uint64_t miss = 0, look = 0;
@@ -3644,7 +3678,7 @@ int main(int argc, char** argv) {
         cudaEvent_t adapt_ev = nullptr;
         cudaEventCreateWithFlags(&adapt_ev, cudaEventDisableTiming);
         auto apply_pending = [&](bool wait) {
-            tier2.apply(wait);
+            for (const auto& t : tiers) t->apply(wait);
             if (pending.empty()) return;
             if (wait) cudaEventSynchronize(adapt_ev);
             else if (cudaEventQuery(adapt_ev) != cudaSuccess) return;
@@ -3668,7 +3702,7 @@ int main(int argc, char** argv) {
                 const float* u = drive.d.usage.data() + l * g.n_expert;
                 const int32_t* r = host_res.data() + l * g.n_expert;
                 for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
-                    if (r[e] < 0) { if (u[e] >= 2.0f && !(tier2.on() && tier2.holds(l, e))) cand.emplace_back(u[e], e); }
+                    if (r[e] < 0) { if (u[e] >= 2.0f && !strata::core::held_by_tier(drive.d.tiers, l, e)) cand.emplace_back(u[e], e); }
                     else vict.emplace_back(u[e], e);
                 }
                 if (cand.empty() || vict.empty()) continue;
@@ -3698,9 +3732,9 @@ int main(int argc, char** argv) {
                 pending.emplace_back((int32_t) in, slot);      // resident once the copy has landed
             }
             if (!swaps.empty()) cudaEventRecord(adapt_ev, adapt_stream);
-            if (tier2.on()) {
+            {
                 std::string e2;
-                if (tier2.adapt(drive.d.usage.data(), host_res.data(), pending, *srcp, o.adapt_swaps, e2) < 0) {
+                if (!strata::core::adapt_tiers(drive.d.tiers, drive.d.usage.data(), host_res, pending, *srcp, o.adapt_swaps, e2)) {
                     std::fprintf(stderr, "strata: %s\n", e2.c_str());
                     return false;
                 }

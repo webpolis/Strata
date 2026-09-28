@@ -63,12 +63,14 @@ if(STRATA_ENABLE_CUDA)
     endif()
   endforeach()
   message(STATUS "Strata: CUDA enabled, arch ${CMAKE_CUDA_ARCHITECTURES}")
-  # A second GPU used only as an expert tier (--second-gpu) runs the expert kernels alone, which need sm_75 (Turing,
-  # RTX 20) at least; they are compiled for it beside the main arch.
-  set(STRATA_SECOND_GPU_ARCH "" CACHE STRING "CUDA arch of a second GPU used as an expert tier (e.g. 75)")
-  if(STRATA_SECOND_GPU_ARCH AND STRATA_SECOND_GPU_ARCH LESS 75)
-    message(FATAL_ERROR "STRATA_SECOND_GPU_ARCH must be 75 or newer, got '${STRATA_SECOND_GPU_ARCH}'.")
-  endif()
+  # Extra GPUs used only as expert tiers (--extra-gpus) run the expert kernels alone, which need sm_75 (Turing, RTX
+  # 20) at least; they are compiled for those archs beside the main one.
+  set(STRATA_EXTRA_GPU_ARCHS "" CACHE STRING "CUDA archs of extra GPUs used as expert tiers (e.g. 75;89)")
+  foreach(_a IN LISTS STRATA_EXTRA_GPU_ARCHS)
+    if(_a LESS 75)
+      message(FATAL_ERROR "STRATA_EXTRA_GPU_ARCHS entries must be 75 or newer, got '${_a}'.")
+    endif()
+  endforeach()
 endif()
 
 # Warnings live on an INTERFACE target the project's own code links, NOT in add_compile_options: applied
@@ -204,9 +206,11 @@ if(STRATA_ENABLE_CUDA)
                           src/ngram/ple_reader.cpp
                           src/platform/direct_file.cpp)
   target_link_libraries(strata_kernels PUBLIC strata_core strata_artifact)
-  if(STRATA_SECOND_GPU_ARCH)
-    set_property(TARGET strata_kernels PROPERTY CUDA_ARCHITECTURES ${CMAKE_CUDA_ARCHITECTURES} ${STRATA_SECOND_GPU_ARCH})
-    message(STATUS "Strata: expert kernels also for the second GPU, arch ${STRATA_SECOND_GPU_ARCH}")
+  if(STRATA_EXTRA_GPU_ARCHS)
+    set(_archs ${CMAKE_CUDA_ARCHITECTURES} ${STRATA_EXTRA_GPU_ARCHS})
+    list(REMOVE_DUPLICATES _archs)
+    set_property(TARGET strata_kernels PROPERTY CUDA_ARCHITECTURES ${_archs})
+    message(STATUS "Strata: expert kernels also for the extra GPUs, archs ${STRATA_EXTRA_GPU_ARCHS}")
   endif()
   # plan v0.3 P6: llama.cpp's block layouts and codebook grids for the i-quant formats (MIT, third_party/ggml)
   target_include_directories(strata_kernels PRIVATE third_party/ggml)
@@ -257,7 +261,7 @@ if(STRATA_ENABLE_CUDA)
   # about arithmetic, and this one knows the ORDER the arithmetic happens in.
   add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp
     src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp
-    src/core/second_tier.cpp)
+    src/core/gpu_tier.cpp)
   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu CUDA::cudart)
 
