@@ -452,16 +452,31 @@ class Vision:
 
 def child_env(cfg: dict) -> dict:
     """The engine's environment: the CUDA libraries setup installed (pip's nvidia packages, or the toolkit that
-    compiled it) first on the library search path."""
+    compiled it) first on the library search path, plus the config's own `env` (which GPUs, in which order)."""
     env = dict(os.environ)
-    if cfg.get("gpu") is not None:                   # issue #51: the GPU to run on, numbered as nvidia-smi does; CUDA's
-        env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"      # own default order (fastest first) can number the cards otherwise
+    env.update(cfg.get("env") or {})
+    if cfg.get("gpu") is not None and "CUDA_VISIBLE_DEVICES" not in (cfg.get("env") or {}):
+        env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
         env["CUDA_VISIBLE_DEVICES"] = str(cfg["gpu"])
     dirs = [d for d in cfg.get("lib_dirs") or [] if Path(d).is_dir()]
     if dirs:
         var = "PATH" if os.name == "nt" else "LD_LIBRARY_PATH"
         env[var] = os.pathsep.join(dirs + ([env[var]] if env.get(var) else []))
     return env
+
+
+def override_gpu(cfg: dict, index: int) -> dict:
+    """A temporary --gpu choice runs on one card, even when the saved config has extra-GPU tiers."""
+    cfg = dict(cfg, gpu=index)
+    cfg["env"] = {k: v for k, v in (cfg.get("env") or {}).items() if k != "CUDA_VISIBLE_DEVICES"}
+    args = list(cfg.get("args") or [])
+    if "--extra-gpus" in args:
+        i = args.index("--extra-gpus")
+        del args[i:i + 2]
+    if "--extra-gpus-optional" in args:
+        args.remove("--extra-gpus-optional")
+    cfg["args"] = args
+    return cfg
 
 
 class ByteTokenizer:
@@ -1469,7 +1484,7 @@ def main() -> int:
     a = ap.parse_args()
     cfg = json.loads(Path(a.config).read_text(encoding="utf-8-sig")) if a.config else {}   # Notepad adds a BOM
     if a.gpu is not None:
-        cfg["gpu"] = a.gpu
+        cfg = override_gpu(cfg, a.gpu)
     a.host = a.host or cfg.get("host") or "127.0.0.1"   # issue #26: the run scripts pass no --host, the config can
     try:                                                # before the minutes of loading: is the port free?
         Server((a.host, a.port), BaseHTTPRequestHandler).server_close()

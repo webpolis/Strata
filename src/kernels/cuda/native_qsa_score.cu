@@ -43,10 +43,15 @@ __device__ __forceinline__ void load_b(TileB& b,const float* p) {
         : "=r"(b.x[0]),"=r"(b.x[1]):"l"(src));
 }
 __device__ __forceinline__ void mma(TileC& c,const TileA& a,const TileB& b) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+    // tf32 mma is sm_80+; an older second GPU only runs the expert kernels and never reaches this
+    __trap();
+#else
     // Deliberately no cvt.rn.tf32: pinned mma.cuh passes raw F32 bits directly.
     asm("mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
         : "+f"(c.x[0]),"+f"(c.x[1]),"+f"(c.x[2]),"+f"(c.x[3])
         : "r"(a.x[0]),"r"(a.x[1]),"r"(a.x[2]),"r"(a.x[3]),"r"(b.x[0]),"r"(b.x[1]));
+#endif
 }
 __global__ __launch_bounds__(64,1) void score_kernel(
         const float* __restrict__ pooled,const float* __restrict__ query,

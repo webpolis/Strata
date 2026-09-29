@@ -3,6 +3,7 @@
 #include "strata/kernels/cpu/expert_layout.hpp"
 
 #include "strata/core/pinned.hpp"
+#include "strata/core/gpu_tier.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
@@ -278,7 +279,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     // ---- plan v0.3 P6: the GPU's share, decided and published FIRST so the GPU starts while the CPU works.
     // Distinct experts in routing order; resident ones and the last pcie_num/256 of the missed ones go to the GPU.
     const int64_t n = n_tok * k;
-    int32_t kind[128];                     // per entry: -1 CPU, 0 VRAM, 1 PCIe
+    int32_t kind[128];                     // per entry: -1 CPU, 0 VRAM, 1 PCIe, 2 + t extra GPU tier t
     if (d.plan != nullptr && n <= 128 && n <= d.plan->cap) {
         int64_t distinct[128], first_of[128];
         int nd = 0, nmiss = 0;
@@ -289,7 +290,9 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             if (first_of[i] == i) {
                 distinct[nd++] = i;
                 const int32_t e = ids[i];
-                if (e >= 0 && e < d.n_expert && d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] < 0) ++nmiss;
+                if (e >= 0 && e < d.n_expert && d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] < 0 &&
+                    tier_of(d.tiers, d.layers, e) < 0)
+                    ++nmiss;
             }
         }
         const bool pcie_ok = d.pcie_num > 0 && d.src->device_alias(d.layers, 0) != nullptr;
@@ -298,6 +301,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         GpuPlanSink& P = *d.plan;
         const uint8_t* dma_src[64];
         int64_t pcie_i0[64];
+        for (GpuTier* t : d.tiers) t->begin(d.layers);
         for (int q = 0; q < nd; ++q) {
             const int64_t i0 = distinct[q];
             const int32_t e = ids[i0];
@@ -309,6 +313,8 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                     kd = 0;
                     ptr = (unsigned long long) (d.cache_base + (d.cache_slot_off ? (size_t) d.cache_slot_off[slot]
                                                                                  : (size_t) slot * (size_t) d.cache_blob));
+                } else if (const int t = tier_of(d.tiers, d.layers, e); t >= 0) {
+                    kd = 2 + t;
                 } else {
                     if (miss_rank >= nmiss - m && fetches < P.staging_cap && fetches < 64) {
                         const uint8_t* src = d.src->blob(d.layers, e);
@@ -324,6 +330,13 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             }
             for (int64_t i = i0; i < n; ++i)
                 if (first_of[i] == i0) kind[i] = kd;
+            if (kd >= 2) {                         // an extra GPU's groups: its own plan, launched below
+                GpuTier* t = d.tiers[(size_t) (kd - 2)];
+                t->add_group(e);
+                for (int64_t i = i0; i < n; ++i)
+                    if (first_of[i] == i0) t->add_entry((int32_t) i, (int32_t) (i / k));
+                continue;
+            }
             if (kd != 0) continue;                 // the VRAM groups first; the PCIe groups below
             P.ptr[groups] = ptr;
             P.start[groups] = entries;
@@ -359,6 +372,15 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         if (P.publish) P.publish(P.ctx);
         pt("fetch", fetches);
         if (P.fetch) P.fetch(P.ctx, dma_src, P.pcie_mode != 0 ? 0 : fetches, (size_t) bb);   // the copy engine, beside the CPU's work
+        std::string e2;
+        for (GpuTier* t : d.tiers)
+            if (!t->launch(x_f, n_tok, e2)) {
+                d.failed = true;
+                d.fail = "an extra GPU could not start its experts";
+                std::fprintf(stderr, "strata: GPU %d: %s\n", t->device(), e2.c_str());
+                d.fail_layer = d.layers;
+                return;
+            }
     } else {
         for (int64_t i = 0; i < n; ++i) {
             const int32_t e = ids[i];
@@ -388,6 +410,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 d.fail_expert = e;
                 return;
             }
+            if (kind[i] >= 2) continue;     // an extra GPU writes this row after the pool
             if (kind[i] >= 0) {             // the GPU computes this entry (a VRAM hit or a PCIe read)
                 if (kind[i] == 0) ++d.cache_hits;
                 std::memset(row, 0, (size_t) H * sizeof(float));
@@ -423,6 +446,15 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     else d.pool->run_split_multi(d.jobs_multi.data(), njobs);
     const auto c4 = std::chrono::steady_clock::now();
     pt("ran");
+    std::string e2;
+    for (GpuTier* t : d.tiers)
+        if (!t->finish(out, e2)) {
+            d.failed = true;
+            d.fail = "an extra GPU's experts failed";
+            std::fprintf(stderr, "strata: GPU %d: %s\n", t->device(), e2.c_str());
+            d.fail_layer = d.layers;
+            return;
+        }
     auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
     d.ms_plan += ms(c0, c1);
     d.ms_actq += ms(c1, c2);

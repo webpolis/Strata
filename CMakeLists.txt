@@ -4,9 +4,8 @@
 # `strata-pack` are added when their sources exist - a target with no sources would make the build graph
 # claim something the tree does not have, which is worse than an absent target.
 #
-# CUDA targets arrive in Phase 2 and this build REJECTS any architecture other than 120: the engine is
-# written against sm_120 (RTX 5000 / Blackwell) and silently building for an older arch would produce a
-# binary that runs and is wrong about its own performance, which is the worst of both outcomes.
+# CUDA targets arrive in Phase 2.  The main engine needs sm_80 or newer; expert tiers on extra GPUs
+# may use sm_75 or newer.
 cmake_minimum_required(VERSION 3.24)
 project(strata VERSION 0.1.19 LANGUAGES CXX)
 add_compile_definitions(STRATA_VERSION="${PROJECT_VERSION}")
@@ -63,6 +62,14 @@ if(STRATA_ENABLE_CUDA)
     endif()
   endforeach()
   message(STATUS "Strata: CUDA enabled, arch ${CMAKE_CUDA_ARCHITECTURES}")
+  # Extra GPUs used only as expert tiers (--extra-gpus) run the expert kernels alone, which need sm_75 (Turing, RTX
+  # 20) at least; they are compiled for those archs beside the main one.
+  set(STRATA_EXTRA_GPU_ARCHS "" CACHE STRING "CUDA archs of extra GPUs used as expert tiers (e.g. 75;89)")
+  foreach(_a IN LISTS STRATA_EXTRA_GPU_ARCHS)
+    if(_a LESS 75)
+      message(FATAL_ERROR "STRATA_EXTRA_GPU_ARCHS entries must be 75 or newer, got '${_a}'.")
+    endif()
+  endforeach()
 endif()
 
 # Warnings live on an INTERFACE target the project's own code links, NOT in add_compile_options: applied
@@ -113,7 +120,7 @@ target_link_libraries(strata-plan PRIVATE strata_plan)
 
 # ---- strata_core (CUDA, Phase 2) ------------------------------------------
 # Only built when CUDA is on, so the Phase 1 targets keep working on a machine with no toolkit.  The arch
-# guard above has already refused anything but sm_120 by the time this runs.
+# guard above has already refused main GPU architectures older than sm_80 by the time this runs.
 if(STRATA_ENABLE_CUDA)
   add_library(strata_core STATIC src/core/device.cu src/core/pinned.cu src/platform/memory.cpp src/core/graph.cpp src/core/weights.cpp
                                src/core/layout.cpp)
@@ -198,6 +205,12 @@ if(STRATA_ENABLE_CUDA)
                           src/ngram/ple_reader.cpp
                           src/platform/direct_file.cpp)
   target_link_libraries(strata_kernels PUBLIC strata_core strata_artifact)
+  if(STRATA_EXTRA_GPU_ARCHS)
+    set(_archs ${CMAKE_CUDA_ARCHITECTURES} ${STRATA_EXTRA_GPU_ARCHS})
+    list(REMOVE_DUPLICATES _archs)
+    set_property(TARGET strata_kernels PROPERTY CUDA_ARCHITECTURES ${_archs})
+    message(STATUS "Strata: expert kernels also for the extra GPUs, archs ${STRATA_EXTRA_GPU_ARCHS}")
+  endif()
   # plan v0.3 P6: llama.cpp's block layouts and codebook grids for the i-quant formats (MIT, third_party/ggml)
   target_include_directories(strata_kernels PRIVATE third_party/ggml)
   # Match the pinned llama.cpp CUDA arithmetic contract for this adapter only.
@@ -246,7 +259,8 @@ if(STRATA_ENABLE_CUDA)
   # library is the honest shape of the dependency graph: core knows about devices and weights, kernels know
   # about arithmetic, and this one knows the ORDER the arithmetic happens in.
   add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp
-    src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp)
+    src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp
+    src/core/gpu_tier.cpp)
   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu CUDA::cudart)
 

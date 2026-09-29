@@ -268,10 +268,17 @@ class GpuChoice(unittest.TestCase):
     """Issue #51: the config's \"gpu\" reaches the engine as CUDA_VISIBLE_DEVICES, numbered like nvidia-smi."""
 
     def test_env(self):
-        from serve.server import child_env
+        from serve.server import child_env, override_gpu
         env = child_env({"gpu": 1})
         self.assertEqual(env["CUDA_VISIBLE_DEVICES"], "1")
         self.assertEqual(env["CUDA_DEVICE_ORDER"], "PCI_BUS_ID")
+        saved = {"gpu": 0, "env": {"CUDA_VISIBLE_DEVICES": "GPU-main,GPU-extra"},
+                 "args": ["--pack", "pack", "--extra-gpus", "1", "--extra-gpus-optional"]}
+        self.assertEqual(child_env(saved)["CUDA_VISIBLE_DEVICES"], "GPU-main,GPU-extra")
+        chosen = override_gpu(saved, 1)
+        self.assertEqual(child_env(chosen)["CUDA_VISIBLE_DEVICES"], "1")
+        self.assertEqual(chosen["args"], ["--pack", "pack"])
+        self.assertEqual(saved["args"][-3:], ["--extra-gpus", "1", "--extra-gpus-optional"])
         plain = child_env({})                     # no choice: the environment as it was (existing installs)
         self.assertEqual(plain.get("CUDA_VISIBLE_DEVICES"), os.environ.get("CUDA_VISIBLE_DEVICES"))
         self.assertEqual(plain.get("CUDA_DEVICE_ORDER"), os.environ.get("CUDA_DEVICE_ORDER"))

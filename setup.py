@@ -259,26 +259,25 @@ def _cpuid_avx512_full() -> bool:
 
 
 def gpus():
-    """Every NVIDIA GPU, numbered as nvidia-smi numbers them (by PCI bus, the order the engine is told to use)."""
-    s = out(["nvidia-smi", "--query-gpu=index,name,memory.total,compute_cap,driver_version",
+    """Every NVIDIA GPU, with its nvidia-smi index and stable CUDA UUID."""
+    s = out(["nvidia-smi", "--query-gpu=index,name,memory.total,compute_cap,driver_version,uuid",
              "--format=csv,noheader,nounits"])
     found = []
     for line in s.strip().splitlines():
         try:
-            idx, name, mem, cc, drv = [x.strip() for x in line.split(",")]
+            idx, name, mem, cc, drv, uuid = [x.strip() for x in line.split(",")]
             found.append({"index": int(idx), "name": name, "vram_gb": float(mem) / 1024.0, "arch": cc.replace(".", ""),
-                          "driver": drv})
+                          "driver": drv, "uuid": uuid})
         except ValueError:
             continue
     return found
 
 
-GPU_PICK = None                                         # --gpu N (issue #51); None: the card with the most VRAM
+GPU_PICK = None                                         # --gpu N; None: the best supported card
 
 
 def gpu_info(pick=None):
-    """The GPU Strata runs on: `pick` (nvidia-smi's number) if given, else the one with the most VRAM (ties: the
-    lower number).  None when there is no NVIDIA GPU.  The dict also says how many there are ("count")."""
+    """The selected GPU, or the largest supported card; include the total GPU count."""
     found = gpus()
     if not found:
         return None
@@ -288,11 +287,65 @@ def gpu_info(pick=None):
         if g is None:
             fail(f"there is no GPU {pick}: " + ", ".join(f"{x['index']} = {x['name']}" for x in found))
     else:
-        g = max(found, key=lambda x: (round(x["vram_gb"]), -x["index"]))
+        usable = [x for x in found if int(x["arch"]) >= 80] or found
+        g = max(usable, key=lambda x: (x["vram_gb"], int(x["arch"]), -x["index"]))
     return {**g, "count": len(found)}
 
 
-def find_nvcc():
+def configured_gpu(cfg_path, override=None):
+    """The card an installed config exposes as CUDA device 0."""
+    cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
+    if override is not None:
+        return gpu_info(override)
+    visible = (cfg.get("env") or {}).get("CUDA_VISIBLE_DEVICES", "").split(",")[0]
+    if not visible:
+        return gpu_info(cfg.get("gpu"))
+    found = gpus()
+    if visible.isdigit():
+        i = int(visible)
+        return next((g for g in found if g["index"] == i), None)
+    return next((g for g in found if g["uuid"] == visible), None)
+
+
+def configured_extra_archs(cfg_path, main):
+    """Kernel architectures for the extra CUDA ordinals selected by an installed config."""
+    cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
+    args = cfg.get("args", [])
+    if "--extra-gpus" not in args:
+        return []
+    cards = gpus()
+    visible = (cfg.get("env") or {}).get("CUDA_VISIBLE_DEVICES")
+    selectors = visible.split(",") if visible else [g["uuid"] for g in cards]
+    selected = []
+    if args.index("--extra-gpus") + 1 >= len(args):
+        return []
+    for ordinal in args[args.index("--extra-gpus") + 1].split(","):
+        try:
+            index = int(ordinal)
+            selector = selectors[index] if index >= 0 else None
+        except (ValueError, IndexError):
+            continue                  # the engine will report an invalid explicit device
+        if selector is None:
+            continue
+        card = next((g for g in cards if g["index"] == int(selector)), None) if selector.isdigit() else \
+            next((g for g in cards if g["uuid"] == selector), None)
+        if card is not None and card["uuid"] != main["uuid"]:
+            selected.append(card)
+    return extra_archs(main, selected)
+
+
+def extra_gpus(main):
+    """Every other GPU that can hold experts beside the main one (RTX 20 or newer, 4 GB or more), biggest first."""
+    rest = [g for g in gpus() if g["uuid"] != main["uuid"] and int(g["arch"]) >= 75 and g["vram_gb"] >= 4]
+    return sorted(rest, key=lambda g: (g["vram_gb"], int(g["arch"])), reverse=True)
+
+
+def extra_archs(main, extras):
+    """The archs the expert kernels need besides the main GPU's."""
+    return sorted({g["arch"] for g in extras} - {main["arch"]})
+
+
+def find_nvcc(max_major=None):
     cands = [shutil.which("nvcc")]
     if os.environ.get("CUDA_PATH"):
         cands.append(str(Path(os.environ["CUDA_PATH"]) / "bin" / ("nvcc.exe" if WIN else "nvcc")))
@@ -307,8 +360,10 @@ def find_nvcc():
     for c in dict.fromkeys(cands):                     # every toolkit found; the newest wins
         if c and Path(c).exists():
             v = re.search(r"release (\d+)\.(\d+)", out([c, "--version"]))
-            if v and (best[1] is None or (int(v.group(1)), int(v.group(2))) > best[1]):
-                best = (c, (int(v.group(1)), int(v.group(2))))
+            if v:
+                version = (int(v.group(1)), int(v.group(2)))
+                if (max_major is None or version[0] < max_major) and (best[1] is None or version > best[1]):
+                    best = (c, version)
     return best
 
 
@@ -459,19 +514,56 @@ def driver_major(gpu):
         return 0
 
 
+def driver_supports_cuda12(gpu):
+    try:
+        version = tuple(int(x) for x in gpu["driver"].split("."))
+    except (ValueError, KeyError):
+        return False
+    return version >= ((528, 33) if WIN else (525, 60, 13))
+
+
+def engine_supports_gpu(meta, gpu):
+    archs = [int(a) for a in meta.get("archs", [])]
+    arch = int(gpu["arch"])
+    return arch in archs or bool(archs and meta.get("ptx") and arch > max(archs))
+
+
+def local_cuda_compatible(meta, gpu):
+    return driver_major(gpu) >= MIN_DRIVER or (driver_supports_cuda12(gpu) and
+                                                str(meta.get("cuda", "")).startswith("12."))
+
+
+def set_config_lib_dirs(cfg_path, cfg, dirs):
+    if cfg.get("lib_dirs") != dirs:
+        cfg["lib_dirs"] = dirs
+        cfg_path.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
+
+
 def get_prebuilt(url_base, gpu, vision, updating=False) -> Path | None:
-    """The ready-made engine in engine/ (kept between runs), or None when there is none for this PC.
-    updating: called to replace an installed engine, which starts instead when this fails (no compile)."""
+    """The ready-made engine in engine/, or None when there is none for this PC."""
+    if driver_major(gpu) < MIN_DRIVER:
+        return None
     eng = ROOT / "engine"
     info = eng / "BUILD.json"
     if info.exists() and (eng / EXE).exists():
         meta = json.loads(info.read_text())
         ver = tuple(int(x) for x in str(meta.get("version", "0")).split(".")[:3] if x.isdigit())
-        if meta.get("source") == "local" or ver >= MIN_ENGINE:
-            ok("ready-made engine already installed")
-            return eng
-        say(f"  Updating the ready-made engine ({meta.get('version')} -> {'.'.join(map(str, MIN_ENGINE))} or newer) ...")
-        info.unlink()
+        if meta.get("source") == "local":
+            if meta.get("archs") == [int(gpu["arch"])] and local_cuda_compatible(meta, gpu) and \
+                    meta.get("src") == source_hash(ENGINE_SOURCES) and \
+                    (vision == "none" or ((eng / VEXE).exists() and meta.get("vision") == vision and
+                                           meta.get("vision_src") == source_hash(VISION_SOURCES))):
+                ok("engine already built for this GPU")
+                return eng
+            return None
+        if ver >= MIN_ENGINE:
+            if engine_supports_gpu(meta, gpu):
+                ok("engine already installed for this GPU")
+                return eng
+            warn(f"the installed engine does not support this main GPU (sm_{gpu['arch']}): finding a compatible engine")
+        else:
+            say(f"  Updating the ready-made engine ({meta.get('version')} -> {'.'.join(map(str, MIN_ENGINE))} or newer) ...")
+            info.unlink()
     if not url_base:
         return None
     z = ROOT / "engine" / PREBUILT_ASSET
@@ -502,7 +594,7 @@ def get_prebuilt(url_base, gpu, vision, updating=False) -> Path | None:
         return None
     archs = [int(a) for a in meta.get("archs", [])]
     arch = int(gpu["arch"])
-    if arch not in archs and not (meta.get("ptx") and arch > max(archs)):
+    if not engine_supports_gpu(meta, gpu):
         warn(f"the ready-made engine is built for {', '.join(str(a) for a in archs)}; your GPU is {arch}" + ("" if updating else ": compiling instead"))
         shutil.rmtree(tmp, ignore_errors=True)
         return None
@@ -525,7 +617,7 @@ def get_prebuilt(url_base, gpu, vision, updating=False) -> Path | None:
     return eng
 
 
-def update_installed_engine(url_base) -> None:
+def update_installed_engine(url_base, cfg_path, gpu_override=None) -> None:
     """An installed ready-made engine older than MIN_ENGINE is replaced before the model starts, so a plain
     START-HERE.bat on an existing install picks up a new release.  If that cannot happen (no internet, the model
     still running, no ready-made engine for this GPU) the installed engine is kept and starts as before."""
@@ -537,12 +629,25 @@ def update_installed_engine(url_base) -> None:
     meta = json.loads(meta_text)
     ver = tuple(int(x) for x in str(meta.get("version", "0")).split(".")[:3] if x.isdigit())
     local = meta.get("source") == "local"
-    vision = meta.get("vision") or "none"
+    cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
+    vision = "gpu" if cfg.get("vision", {}).get("gpu") else "cpu" if cfg.get("vision") else "none"
+    gpu = configured_gpu(cfg_path, gpu_override)
+    if gpu is None:
+        warn("the configured main GPU is unavailable; run setup again to choose a GPU")
+        return
+    uses_extra_gpus = gpu_override is None and "--extra-gpus" in cfg.get("args", [])
+    archs2 = configured_extra_archs(cfg_path, gpu) if uses_extra_gpus else []
     if local:                                          # compiled here: is it older than the source (a git pull)?
-        if meta.get("src") == source_hash(ENGINE_SOURCES) and \
-                (vision == "none" or meta.get("vision_src") == source_hash(VISION_SOURCES)):
+        if engine_supports_gpu(meta, gpu) and local_cuda_compatible(meta, gpu) and \
+                (gpu_override is not None or meta.get("extra_archs", []) == archs2) and \
+                meta.get("src") == source_hash(ENGINE_SOURCES) and \
+                (vision == "none" or ((eng / VEXE).exists() and meta.get("vision") == vision and
+                                      meta.get("vision_src") == source_hash(VISION_SOURCES))):
+            set_config_lib_dirs(cfg_path, cfg, meta.get("cuda_dirs") or [])
             return
-    elif ver >= MIN_ENGINE:
+    elif not uses_extra_gpus and ver >= MIN_ENGINE and engine_supports_gpu(meta, gpu) and \
+            driver_major(gpu) >= MIN_DRIVER:
+        set_config_lib_dirs(cfg_path, cfg, cuda_lib_dirs())
         return
     try:                                               # a running engine cannot be replaced (Windows keeps it locked)
         for x in (EXE, VEXE):
@@ -552,13 +657,18 @@ def update_installed_engine(url_base) -> None:
     except OSError:
         warn(f"engine {meta.get('version') or ''} is in use: close the model window and run this again to update it")
         return
-    gpu = gpu_info()
-    if local:
+    if local or uses_extra_gpus or driver_major(gpu) < MIN_DRIVER:
         try:                                           # a failed compile must not stop the model from starting
-            if gpu is None:
-                raise RuntimeError("no NVIDIA GPU found")
-            build_engine(gpu, vision, False, get_llama_cpp())
+            built = build_engine(gpu, vision, False, get_llama_cpp(), archs2)
+            built_meta = json.loads((built / "BUILD.json").read_text())
+            set_config_lib_dirs(cfg_path, cfg, built_meta.get("cuda_dirs") or [])
         except (Exception, SystemExit) as e:
+            if driver_major(gpu) < MIN_DRIVER and not local_cuda_compatible(meta, gpu):
+                fail("the installed engine cannot run on this driver and a local build failed",
+                     "install a compatible CUDA 12 toolkit or update the NVIDIA driver, then run setup again")
+            if uses_extra_gpus and not local:
+                fail("the installed engine does not support extra GPUs and a local build failed",
+                     "install a compatible CUDA toolkit and run setup again, or disable extra GPUs")
             warn(f"could not compile the updated engine{'' if isinstance(e, SystemExit) else f' ({e})'}: starting the installed one")
         return
     new = None
@@ -573,22 +683,27 @@ def update_installed_engine(url_base) -> None:
         warn(f"could not update the engine: starting the installed {meta.get('version')}")
         return
     pip_install(CUDA_WHEELS, "NVIDIA CUDA libraries (cuBLAS, CUDA runtime; ~0.4 GB)")
+    set_config_lib_dirs(cfg_path, cfg, cuda_lib_dirs())
 
 
-def install_build_tools(gpu, yes):
-    """The compiler and the CUDA toolkit, installed for the user (asks once).  Returns (nvcc, vcvars)."""
-    nvcc, cuda_v = find_nvcc()
-    need_cuda = (12, 8) if int(gpu["arch"]) >= 120 else (12, 0)
+def install_build_tools(gpu, yes, archs2=()):
+    """The compiler and a driver-compatible CUDA toolkit.  Returns (nvcc, vcvars, CUDA version)."""
+    old_driver = driver_major(gpu) < MIN_DRIVER
+    if old_driver and not driver_supports_cuda12(gpu):
+        fail(f"driver {gpu['driver']} is too old for CUDA 12; update the NVIDIA driver")
+    toolkit_version = "12.8" if old_driver else "13.0"
+    nvcc, cuda_v = find_nvcc(max_major=13 if old_driver else 14)
+    need_cuda = (12, 8) if max([int(gpu["arch"]), *(int(a) for a in archs2)]) >= 120 else (12, 0)
     vcvars = find_vcvars() if WIN else None
     have_cc = vcvars is not None if WIN else shutil.which("g++") is not None
     missing = []
     if not have_cc:
         missing.append("Visual Studio 2022 Build Tools (C++)" if WIN else "the C++ compiler (build-essential)")
     if nvcc is None or cuda_v < need_cuda:
-        missing.append("the NVIDIA CUDA Toolkit 13.0")
+        missing.append(f"the NVIDIA CUDA Toolkit {toolkit_version}")
     if not missing:
         ok(f"build tools present (CUDA {cuda_v[0]}.{cuda_v[1]})")
-        return nvcc, vcvars
+        return nvcc, vcvars, cuda_v
     say("  The engine has to be compiled for your PC, which needs: " + " and ".join(missing) + ".")
     say("  They can be installed now (about 8-10 GB, 15-40 minutes" + (", Windows will ask for permission" if WIN else
                                                                         ", sudo will ask for your password") + ").")
@@ -605,7 +720,7 @@ def install_build_tools(gpu, yes):
                  "--quiet --wait --norestart --nocache --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"],
                 check=False)
         if nvcc is None or cuda_v < need_cuda:
-            run([*wg, "--id", "Nvidia.CUDA", "--version", "13.0"], check=False)
+            run([*wg, "--id", "Nvidia.CUDA", "--version", toolkit_version], check=False)
         vcvars = find_vcvars()
     else:
         apt = shutil.which("apt-get")
@@ -626,14 +741,15 @@ def install_build_tools(gpu, yes):
                      deb, "CUDA repository key")
             run(["sudo", "dpkg", "-i", str(deb)])
             run(["sudo", "apt-get", "update"])
-            run(["sudo", "apt-get", "install", "-y", "cuda-toolkit-13-0"])
-    nvcc, cuda_v = find_nvcc()
+            run(["sudo", "apt-get", "install", "-y", "cuda-toolkit-12-8" if old_driver else "cuda-toolkit-13-0"])
+    nvcc, cuda_v = find_nvcc(max_major=13 if old_driver else 14)
     if (WIN and find_vcvars() is None) or (not WIN and shutil.which("g++") is None):
         fail("the C++ build tools did not install", "install them by hand (README.md) and run it again")
     if nvcc is None or cuda_v < need_cuda:
-        fail("the CUDA Toolkit did not install", "install it from https://developer.nvidia.com/cuda-downloads, then run it again")
+        fail(f"a compatible CUDA Toolkit ({toolkit_version}) is missing",
+             "install it from https://developer.nvidia.com/cuda-downloads, or update the NVIDIA driver, then run this again")
     ok(f"build tools installed (CUDA {cuda_v[0]}.{cuda_v[1]})")
-    return nvcc, find_vcvars() if WIN else None
+    return nvcc, find_vcvars() if WIN else None, cuda_v
 
 
 def cmake_build(src, bdir, target, defs, vcvars, bat_name):
@@ -674,9 +790,10 @@ def source_hash(parts) -> str:
     return h.hexdigest()[:16]
 
 
-def build_engine(gpu, vision, yes, llama) -> Path:
-    """Compile the engine (and, for images, the encoder) for this GPU; the results go to engine/.  A compiled
-    engine whose source files changed since (a `git pull`) is compiled again: only the changed files, a few minutes."""
+def build_engine(gpu, vision, yes, llama, archs2=()) -> Path:
+    """Compile the engine (and, for images, the encoder) for this GPU, and its expert kernels for the extra GPUs'
+    `archs2` too; the results go to engine/.  A compiled engine whose source files changed since (a `git pull`) is
+    compiled again: only the changed files, a few minutes."""
     eng = ROOT / "engine"
     eng.mkdir(exist_ok=True)
     stamp = eng / "BUILD.json"
@@ -684,30 +801,43 @@ def build_engine(gpu, vision, yes, llama) -> Path:
     want_vision = vision != "none"
     local = meta.get("source") == "local"
     src, vsrc = source_hash(ENGINE_SOURCES), source_hash(VISION_SOURCES)
-    engine_ok = local and (eng / EXE).exists() and meta.get("src") == src
-    vision_ok = not want_vision or ((eng / VEXE).exists() and (not local or meta.get("vision_src") == vsrc))
+    same_main_arch = meta.get("archs") == [int(gpu["arch"])]
+    toolkit_ok = local_cuda_compatible(meta, gpu)
+    engine_ok = local and (eng / EXE).exists() and meta.get("src") == src and same_main_arch and toolkit_ok and \
+        meta.get("extra_archs", []) == list(archs2)
+    vision_ok = not want_vision or (local and (eng / VEXE).exists() and meta.get("vision") == vision and
+                                    meta.get("vision_src") == vsrc and
+                                    (vision != "gpu" or (same_main_arch and toolkit_ok)))
     if engine_ok and vision_ok:
         ok("engine already built for this PC")
         return eng
-    nvcc, vcvars = install_build_tools(gpu, yes)
+    nvcc, vcvars, cuda_v = install_build_tools(gpu, yes, archs2)
+    if engine_ok and meta.get("cuda") != f"{cuda_v[0]}.{cuda_v[1]}":
+        engine_ok = False
+        if vision == "gpu":
+            vision_ok = False
+    build_dir = ROOT / f"build-cuda-{cuda_v[0]}-{cuda_v[1]}"
     if not engine_ok:
         say("  The engine's source changed: compiling it again (only what changed, a few minutes) ..."
             if local and (eng / EXE).exists() else "  Compiling the Strata engine for your GPU (10-20 minutes, once) ...")
-        cmake_build(ROOT, ROOT / "build", "strata",
+        cmake_build(ROOT, build_dir, "strata",
                     ["-DSTRATA_ENABLE_CUDA=ON", "-DSTRATA_BUILD_TESTS=OFF", f"-DCMAKE_CUDA_ARCHITECTURES={gpu['arch']}",
-                     f"-DCMAKE_CUDA_COMPILER={nvcc}", f"-DSTRATA_GGML_DIR={llama}"], vcvars, "build-strata.bat")
-        shutil.copy2(ROOT / "build" / EXE, eng / EXE)
+                     f"-DCMAKE_CUDA_COMPILER={nvcc}", f"-DSTRATA_GGML_DIR={llama}",
+                     f"-DSTRATA_EXTRA_GPU_ARCHS={';'.join(archs2)}"], vcvars, "build-strata.bat")
+        shutil.copy2(build_dir / EXE, eng / EXE)
     if not vision_ok:
         say("  Compiling the image encoder" + (" with CUDA (10-20 minutes, once) ..." if vision == "gpu" else " ..."))
         defs = [f"-DLLAMA_DIR={llama}", f"-DSTRATA_VISION_CUDA={'ON' if vision == 'gpu' else 'OFF'}"]
         if vision == "gpu":
             defs += [f"-DCMAKE_CUDA_ARCHITECTURES={gpu['arch']}", f"-DCMAKE_CUDA_COMPILER={nvcc}"]
-        cmake_build(ROOT / "tools" / "vision", ROOT / "build-vision", "strata-vision", defs, vcvars, "build-vision.bat")
-        shutil.copy2(ROOT / "build-vision" / "bin" / VEXE, eng / VEXE)
+        vision_dir = ROOT / f"build-vision-cuda-{cuda_v[0]}-{cuda_v[1]}" if vision == "gpu" else ROOT / "build-vision"
+        cmake_build(ROOT / "tools" / "vision", vision_dir, "strata-vision", defs, vcvars, "build-vision.bat")
+        shutil.copy2(vision_dir / "bin" / VEXE, eng / VEXE)
     bindir = Path(nvcc).parent                            # the toolkit's own libraries (bin, bin/x64, lib64)
     dirs = [str(d) for d in (bindir, bindir / "x64", bindir.parent / "lib64") if d.is_dir()]
-    stamp.write_text(json.dumps({"source": "local", "version": source_version(), "archs": [int(gpu["arch"])],
-                                 "vision": vision,
+    stamp.write_text(json.dumps({"source": "local", "version": source_version(), "cuda": f"{cuda_v[0]}.{cuda_v[1]}",
+                                 "archs": [int(gpu["arch"])],
+                                 "extra_archs": list(archs2), "vision": vision,
                                  "cuda_dirs": dirs, "src": src, "vision_src": vsrc if want_vision else None}, indent=1))
     ok(f"engine compiled: {eng / EXE}")
     return eng
@@ -990,7 +1120,8 @@ def saved_calibration(cfg: dict) -> dict | None:
 def upgrade_config(cfg_path: Path, cfg: dict) -> dict:
     """Configs written before v0.1.13 read prompts in fixed 2048-token chunks; the engine now picks the chunk
     itself (`--prefill auto`: up to 8192, as the free VRAM allows - about 2x faster on long prompts).  Under WSL,
-    KV streaming is dropped: its RAM copy must be pinned, and the driver pins only about 1 GB there."""
+    KV streaming is dropped: its RAM copy must be pinned, and the driver pins only about 1 GB there.  Existing
+    setup-generated extra-GPU configs allow an unavailable card to be skipped once the new engine is installed."""
     a = cfg.get("args", [])
     changed = False
     ver = engine_version(cfg["exe"]) if "--prefill" in a else (0, 0, 0)
@@ -1007,6 +1138,14 @@ def upgrade_config(cfg_path: Path, cfg: dict) -> dict:
         del a[i:i + 2]
         changed = True
         ok("WSL: KV streaming off (the driver pins only about 1 GB of RAM); the KV cache stays in VRAM")
+    if "--extra-gpus" in a and "--extra-gpus-optional" not in a and cfg.get("env", {}).get("CUDA_VISIBLE_DEVICES"):
+        try:
+            meta = json.loads((Path(cfg["exe"]).parent / "BUILD.json").read_text())
+        except (OSError, ValueError):
+            meta = {}
+        if meta.get("source") == "local" and meta.get("src") == source_hash(ENGINE_SOURCES):
+            a.append("--extra-gpus-optional")
+            changed = True
     if changed:
         cfg_path.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
     return cfg
@@ -1088,6 +1227,8 @@ def main() -> int:
     ap.add_argument("--prebuilt", default=os.environ.get("STRATA_PREBUILT_URL", PREBUILT_URL),
                     help="where the ready-made engine is (a URL folder or a local folder)")
     ap.add_argument("--check", action="store_true", help="only check this PC and exit")
+    ap.add_argument("--extra-gpus", choices=["auto", "off"], default="auto",
+                    help="use the other GPUs (RTX 20 or newer) as more expert caches (auto: every one there is)")
     ap.add_argument("--calibrate", action="store_true",
                     help="tune the engine's settings for this PC (about 5-10 minutes), then start the model")
     ap.add_argument("--skip-build", action="store_true", help=argparse.SUPPRESS)
@@ -1120,20 +1261,23 @@ def main() -> int:
     GPU_PICK = a.gpu
     port = a.port or 8080                              # a new install's port (issue #32: --port for an existing one)
     if have and a.calibrate and not (a.setup or a.model or a.family or a.check):
-        if not a.build:
-            update_installed_engine(a.prebuilt)
+        if a.gpu is not None:
+            fail("--calibrate uses the installed GPU selection, not a temporary --gpu override",
+                 "run --setup --gpu N to save that GPU, then run --calibrate")
         pick_cfg = have[0]
         if len(have) > 1:
             say()
             for i, c in enumerate(have, 1):
                 say(f"  {i}) {json.loads(c.read_text(encoding='utf-8-sig')).get('model_name', c.stem)}")
             pick_cfg = have[int(ask("Tune which one?", [str(i) for i in range(1, len(have) + 1)], "1", a.yes)) - 1]
+        if not a.build:
+            update_installed_engine(a.prebuilt, pick_cfg)
         calibrate_config(pick_cfg)
         return 0 if a.no_start else start(pick_cfg, a.port, a.gpu)
     if have and not (a.setup or a.model or a.family or a.check or a.no_start):
-        if not a.build:
-            update_installed_engine(a.prebuilt)
         if len(have) == 1:
+            if not a.build:
+                update_installed_engine(a.prebuilt, have[0], a.gpu)
             return start(have[0], a.port, a.gpu)
         say()
         for i, c in enumerate(have, 1):
@@ -1141,6 +1285,8 @@ def main() -> int:
         say(f"  {len(have) + 1}) install another model / change settings")
         pick = int(ask("Which one?", [str(i) for i in range(1, len(have) + 2)], "1", a.yes))
         if pick <= len(have):
+            if not a.build:
+                update_installed_engine(a.prebuilt, have[pick - 1], a.gpu)
             return start(have[pick - 1], a.port, a.gpu)
 
     # ---- 1. the PC
@@ -1159,8 +1305,14 @@ def main() -> int:
     if int(gpu["arch"]) < 80:
         fail("this GPU is older than the RTX 30 series (compute capability 8.0 is required)")
     if driver_major(gpu) < MIN_DRIVER:
-        fail(f"the NVIDIA driver is too old ({gpu['driver']}; {MIN_DRIVER} or newer is needed)",
-             "update it with the NVIDIA App or from https://www.nvidia.com/drivers, restart, and run this again")
+        if not driver_supports_cuda12(gpu):
+            fail(f"driver {gpu['driver']} is too old for CUDA 12; update the NVIDIA driver")
+        warn(f"driver {gpu['driver']}: the ready-made engine needs {MIN_DRIVER} or newer, so it is compiled here "
+             "with a compatible CUDA 12 toolkit")
+        a.build = True
+    extras = extra_gpus(gpu) if a.extra_gpus == "auto" else []
+    for g in extras:
+        ok(f"extra GPU: {g['name']}, {g['vram_gb']:.1f} GB VRAM - another expert cache")
     if gpu["vram_gb"] < 11:
         warn("less than 12 GB of VRAM: Strata will run, but most experts stay on the CPU and it will be slow")
     ram = ram_gb()
@@ -1217,6 +1369,11 @@ def main() -> int:
         fail(f"{model} needs about {MODELS[model]['ram_gb']} GB of RAM; this PC has {ram:.0f} GB",
              "choose Q2_0 or IQ2_XS, or add RAM")
     ok(f"size: {model}")
+    if extras and model == "Q2_0" and avx512 and family == "qwen":
+        warn("the AVX-512 Q2_0 pack has no extra-GPU tiers: using one GPU")
+        extras = []
+    if extras:
+        a.build = True                                 # the ready-made engine has no extra-GPU tiers
     tag = fam["tag"] + model                           # names of the pack, config and start script
     rec_ctx = 32768 if gpu["vram_gb"] < 14 else 65536 if gpu["vram_gb"] < 20 else 131072
     if a.context:
@@ -1294,14 +1451,14 @@ def main() -> int:
     step(4, "the Strata engine")
     llama = get_llama_cpp()
     ok(f"llama.cpp {LLAMA_CPP_COMMIT[:7]} (gguf-py, ggml, mtmd)")
-    eng = None if a.build else get_prebuilt(a.prebuilt, gpu, vision)
+    eng = None if a.build or extras else get_prebuilt(a.prebuilt, gpu, vision)
     if eng is not None and json.loads((eng / "BUILD.json").read_text()).get("source") != "local":
         pip_install(CUDA_WHEELS, "NVIDIA CUDA libraries (cuBLAS, CUDA runtime; ~0.4 GB)")
         if vision != "none" and not (eng / VEXE).exists():
             warn("the ready-made engine has no image encoder: compiling it")
             eng = None
     if eng is None:
-        eng = build_engine(gpu, vision, a.yes, llama)
+        eng = build_engine(gpu, vision, a.yes, llama, extra_archs(gpu, extras))
     meta = json.loads((eng / "BUILD.json").read_text())
     lib_dirs = meta.get("cuda_dirs") or cuda_lib_dirs()
     ok(f"engine: {eng / EXE}")
@@ -1395,6 +1552,8 @@ def main() -> int:
         ok(f"KV streaming on: the context's KV cache lives in RAM ({kv_ram_gb:.1f} GB), more experts fit in VRAM")
     if vision != "none":
         args += ["--vision", "--vram-reserve-mib", str(VISION[vision]["reserve_mib"])]
+    if extras:
+        args += ["--extra-gpus", ",".join(str(i) for i in range(1, len(extras) + 1)), "--extra-gpus-optional"]
     if esp is not None:
         # the package's profile, with llama.cpp's flags (the engine takes the same ones)
         args += ["--control-vector-scaled", f"{esp}:1.0", "--control-vector-layer-range", "4", "44",
@@ -1402,6 +1561,8 @@ def main() -> int:
     cfg = {"exe": str(eng / EXE), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
            "model_name": f"{fam['name']}-{model.lower()}", "log": str(ROOT / f"strata-{tag.lower()}.log"),
            "lib_dirs": lib_dirs, "port": port}
+    if len(gpus()) > 1:                                # the main GPU is CUDA device 0, the extra ones 1, 2, ...
+        cfg["env"] = {"CUDA_VISIBLE_DEVICES": ",".join(g["uuid"] for g in [gpu, *extras])}
     if gpu["count"] > 1 or a.gpu is not None:
         cfg["gpu"] = gpu["index"]                      # the engine is told this card (issue #51)
     if a.host:

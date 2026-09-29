@@ -86,7 +86,11 @@ void* reserve(uint64_t bytes, PageBacking& got, std::string& note) {
     note = "MAP_HUGETLB unavailable (no hugetlb pool configured?); using 4 KB pages";
     p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     got = PageBacking::NormalPages;
-    return p == MAP_FAILED ? nullptr : p;
+    if (p == MAP_FAILED) return nullptr;
+    // Transparent huge pages need only this advice (the default THP mode is "madvise"): 2 MB pages let the CPU's
+    // prefetchers run across a whole expert instead of stopping at every 4 KB boundary.
+    if (madvise(p, bytes, MADV_HUGEPAGE) == 0) note = "no hugetlb pool; transparent 2 MB pages (MADV_HUGEPAGE)";
+    return p;
 #endif
 }
 
