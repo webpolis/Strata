@@ -500,7 +500,9 @@ def gpu_info(pick=None):
     return {**g, "count": len(found)}
 
 
-def find_nvcc():
+def find_nvcc(max_major=None):
+    """The newest CUDA toolkit on this PC (its nvcc and version); `max_major` leaves out newer ones the driver
+    cannot run (a CUDA 13 build needs driver 580)."""
     cands = [shutil.which("nvcc")]
     if os.environ.get("CUDA_PATH"):
         cands.append(str(Path(os.environ["CUDA_PATH"]) / "bin" / ("nvcc.exe" if WIN else "nvcc")))
@@ -515,7 +517,8 @@ def find_nvcc():
     for c in dict.fromkeys(cands):                     # every toolkit found; the newest wins
         if c and Path(c).exists():
             v = re.search(r"release (\d+)\.(\d+)", out([c, "--version"]))
-            if v and (best[1] is None or (int(v.group(1)), int(v.group(2))) > best[1]):
+            if v and (max_major is None or int(v.group(1)) <= max_major) and \
+                    (best[1] is None or (int(v.group(1)), int(v.group(2))) > best[1]):
                 best = (c, (int(v.group(1)), int(v.group(2))))
     return best
 
@@ -830,9 +833,21 @@ def driver_major(gpu):
         return 0
 
 
+def driver_supports_cuda12(gpu) -> bool:
+    """A driver older than MIN_DRIVER can still run an engine compiled with a CUDA 12 toolkit (12.x needs 525.60 on
+    Linux, 528.33 on Windows)."""
+    try:
+        version = tuple(int(x) for x in gpu["driver"].split("."))
+    except (ValueError, KeyError):
+        return False
+    return version >= ((528, 33) if WIN else (525, 60, 13))
+
+
 def get_prebuilt(url_base, gpu, vision, updating=False) -> Path | None:
     """The ready-made engine in engine/ (kept between runs), or None when there is none for this PC.
     updating: called to replace an installed engine, which starts instead when this fails (no compile)."""
+    if driver_major(gpu) < MIN_DRIVER:                 # the ready-made engine is built with CUDA 13: compiled here
+        return None
     eng = ROOT / "engine"
     info = eng / "BUILD.json"
     if info.exists() and (eng / EXE).exists():
@@ -971,16 +986,20 @@ def update_installed_engine(url_base) -> None:
 
 def install_build_tools(gpu, yes):
     """The compiler and the CUDA toolkit, installed for the user (asks once).  Returns (nvcc, vcvars)."""
-    nvcc, cuda_v = find_nvcc()
+    # a driver older than MIN_DRIVER cannot run a CUDA 13 build: the newest CUDA 12 toolkit then (12.8 for RTX 50)
+    old_driver = driver_major(gpu) < MIN_DRIVER
+    toolkit = "12.8" if old_driver else "13.0"
+    nvcc, cuda_v = find_nvcc(max_major=12 if old_driver else None)
     # RTX 50 (sm_120): CUDA 13.0 - an engine built with 12.8 crashed in the prompt path on Linux (#220)
-    need_cuda = (13, 0) if max(int(x) for x in gpu.get("archs", [gpu["arch"]])) >= 120 else (12, 0)
+    rtx50 = max(int(x) for x in gpu.get("archs", [gpu["arch"]])) >= 120
+    need_cuda = ((12, 8) if old_driver else (13, 0)) if rtx50 else (12, 0)
     vcvars = find_vcvars() if WIN else None
     have_cc = vcvars is not None if WIN else shutil.which("g++") is not None
     missing = []
     if not have_cc:
         missing.append("Visual Studio 2022 Build Tools (C++)" if WIN else "the C++ compiler (build-essential)")
     if nvcc is None or cuda_v < need_cuda:
-        missing.append("the NVIDIA CUDA Toolkit 13.0")
+        missing.append(f"the NVIDIA CUDA Toolkit {toolkit}")
     if not missing:
         ok(f"build tools present (CUDA {cuda_v[0]}.{cuda_v[1]})")
         return nvcc, vcvars
@@ -1000,7 +1019,7 @@ def install_build_tools(gpu, yes):
                  "--quiet --wait --norestart --nocache --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"],
                 check=False)
         if nvcc is None or cuda_v < need_cuda:
-            run([*wg, "--id", "Nvidia.CUDA", "--version", "13.0"], check=False)
+            run([*wg, "--id", "Nvidia.CUDA", "--version", toolkit], check=False)
         vcvars = find_vcvars()
     else:
         apt = shutil.which("apt-get")
@@ -1021,8 +1040,8 @@ def install_build_tools(gpu, yes):
                      deb, "CUDA repository key")
             run(["sudo", "dpkg", "-i", str(deb)])
             run(["sudo", "apt-get", "update"])
-            run(["sudo", "apt-get", "install", "-y", "cuda-toolkit-13-0"])
-    nvcc, cuda_v = find_nvcc()
+            run(["sudo", "apt-get", "install", "-y", "cuda-toolkit-" + toolkit.replace(".", "-")])
+    nvcc, cuda_v = find_nvcc(max_major=12 if old_driver else None)
     if (WIN and find_vcvars() is None) or (not WIN and shutil.which("g++") is None):
         fail("the C++ build tools did not install", "install them by hand (README.md) and run it again")
     if nvcc is None or cuda_v < need_cuda:
@@ -1789,9 +1808,13 @@ def main() -> int:
         if multi:
             ok("GPUs: " + " + ".join(gpu_name(x) for x in chosen) + " together (the model's layers are split across them)")
         ok(f"GPU: {gpu['name']}, {gpu['vram_gb']:.1f} GB VRAM, compute capability {cc(gpu)}, driver {gpu['driver']}")
-        if driver_major(gpu) < MIN_DRIVER:
-            fail(f"the NVIDIA driver is too old ({gpu['driver']}; {MIN_DRIVER} or newer is needed)",
-                 "update it with the NVIDIA App or from https://www.nvidia.com/drivers, restart, and run this again")
+        if driver_major(gpu) < MIN_DRIVER:             # the ready-made engine needs it; a CUDA 12 build runs here
+            if not driver_supports_cuda12(gpu):
+                fail(f"the NVIDIA driver is too old ({gpu['driver']}; {MIN_DRIVER} or newer is needed)",
+                     "update it with the NVIDIA App or from https://www.nvidia.com/drivers, restart, and run this again")
+            warn(f"driver {gpu['driver']}: the ready-made engine needs {MIN_DRIVER} or newer, so the engine is "
+                 "compiled here with a CUDA 12 toolkit (update the driver to skip this)")
+            a.build = True
     if gpu["vram_gb"] < 11:
         warn("less than 12 GB of VRAM: Strata will run, but most experts stay on the CPU and it will be slow")
     ram = ram_gb()
