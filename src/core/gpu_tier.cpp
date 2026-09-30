@@ -83,10 +83,11 @@ bool GpuTier::open(int device, int home, int64_t n_layers, int64_t n_expert, int
         return false;
     }
     std::memset(h_in_, 0, in_bytes);
-    // Zero-copy: the card reads the activations from, and writes its rows into, the pinned host blocks directly -
-    // two copies fewer per layer, each a PCIe round trip the host had to start.  STRATA_TIER_ZEROCOPY=0 copies.
+    // Zero-copy (STRATA_TIER_ZEROCOPY=1): the card reads the activations from, and writes its rows into, the pinned
+    // host blocks directly - two copies fewer per layer.  Off by default: on an RTX 3060 + RTX 2060 the kernels'
+    // reads over PCIe cost more than the copies they save (27.0 vs 32.7 tok/s decode, 256 tokens).
     const char* zc = std::getenv("STRATA_TIER_ZEROCOPY");
-    zero_copy_ = !(zc && zc[0] == '0') &&
+    zero_copy_ = zc && zc[0] == '1' &&
                  cudaHostGetDevicePointer((void**) &z_in_, h_in_, 0) == cudaSuccess &&
                  cudaHostGetDevicePointer((void**) &z_out_, h_out_, 0) == cudaSuccess;
     cudaGetLastError();

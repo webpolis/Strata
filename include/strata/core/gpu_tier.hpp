@@ -1,11 +1,10 @@
 // include/strata/core/gpu_tier.hpp - extra GPUs as more expert tiers.
 //
 // The main card's cache holds the most-routed experts; each extra card holds the ones ranked next, which the CPU
-// would otherwise compute.  Per layer of a verify window the host writes the window's activations into a pinned
-// block the card reads directly (zero-copy; STRATA_TIER_ZEROCOPY=0 copies them instead), the card computes them
-// with the main card's own kernels (quantize_q8_1_rows + native_expert_grouped) and writes the rows into a pinned
-// block the host reads back into the CPU's mapped rows before the layer's flag is raised - so the main card's graph
-// is unchanged.  Native packs only.
+// would otherwise compute.  Per layer of a verify window the host copies the window's activations to the card
+// (or the card reads them from the pinned block in place: STRATA_TIER_ZEROCOPY=1), the card computes them with the
+// main card's own kernels (quantize_q8_1_rows + native_expert_grouped), and the rows come back into the CPU's
+// mapped rows before the host raises the layer's flag - so the main card's graph is unchanged.  Native packs only.
 #pragma once
 
 #include "strata/core/expert_cache.hpp"
