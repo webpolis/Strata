@@ -99,6 +99,10 @@ bool refill_blocking() {
 
 using Clock = std::chrono::steady_clock;
 
+/// An expert an extra GPU holds moves up to the main card's cache only when its decayed routing count exceeds the
+/// least-routed resident one's by this much more than an expert nowhere on a GPU needs to.
+constexpr float kPromoteBar = 3.0f;
+
 struct Options {
     std::string pack = "pack/full";
     std::vector<int64_t> tokens;      // the prompt, PRE-TOKENIZED
@@ -235,6 +239,12 @@ struct Options {
     std::vector<int64_t> extra_gpus;
     std::vector<int64_t> extra_gpu_reserve_mib = {256};
     bool extra_gpus_optional = false;
+    /// An extra GPU takes a layer of a verify window only when at least this many of its entries route to experts
+    /// the card holds (fewer are not worth its launch and round trip: they stay on the CPU).
+    int extra_gpu_min_entries = 1;
+    /// Bytes every card's adaptive swaps may copy per round together (0 = what the main card's --adapt-swaps
+    /// alone could move): the cards' copy streams share the PCIe links and the arena's memory bandwidth.
+    int adapt_budget_mib = 0;
     /// Plan v0.3 P5: batched prompt processing in chunks of this many tokens (0 = the token path).
     int64_t prefill_chunk = 0;
     /// `--prefill auto`: the largest chunk (up to 8192) whose buffers the expert cache can lend.  Every expert a chunk
@@ -430,6 +440,10 @@ void usage() {
                  "  --extra-gpu-reserve-mib LIST  MiB each extra GPU leaves free (default 256; the last value\n"
                  "                       repeats).\n"
                  "  --extra-gpus-optional  Skip a listed extra GPU if it cannot start or hold an expert.\n"
+                 "  --extra-gpu-min-entries N  An extra GPU takes a layer only when N or more of the window's\n"
+                 "                       entries route to experts it holds (default 1); fewer stay on the CPU.\n"
+                 "  --adapt-budget-mib N  MiB all cards' adaptive swaps may copy per round together (default 0:\n"
+                 "                       what --adapt-swaps on the main card alone could move).\n"
                  "  --expert-cache-device1 N  pre-fill N experts on CUDA1 (experimental)\n"
                  "  --expert-cache-device2 N  pre-fill N more experts on CUDA2\n"
                  "  --expert-cache-device3 N  pre-fill N more experts on CUDA3\n"
@@ -1009,6 +1023,8 @@ int main(int argc, char** argv) {
             o.expert_cache_remote_placement = next("--expert-cache-remote-placement");
         else if (a == "--vram-reserve-mib") o.vram_reserve_mib = std::atoi(next("--vram-reserve-mib"));
         else if (a == "--extra-gpus-optional") o.extra_gpus_optional = true;
+        else if (a == "--extra-gpu-min-entries") o.extra_gpu_min_entries = std::atoi(next("--extra-gpu-min-entries"));
+        else if (a == "--adapt-budget-mib") o.adapt_budget_mib = std::atoi(next("--adapt-budget-mib"));
         else if (a == "--extra-gpus" || a == "--extra-gpu-reserve-mib") {
             std::vector<int64_t>& dst = a == "--extra-gpus" ? o.extra_gpus : o.extra_gpu_reserve_mib;
             std::string e;
@@ -2397,6 +2413,10 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: --extra-gpus cannot be combined with --layer-split or --expert-cache-device1\n");
             return 2;
         }
+        if (o.extra_gpus.size() > 8) {
+            std::fprintf(stderr, "strata generate: --extra-gpus takes up to 8 devices\n");
+            return 2;
+        }
         int home = 0;
         if (const cudaError_t e = cudaGetDevice(&home); e != cudaSuccess) {
             std::fprintf(stderr, "strata generate: cannot identify the main GPU: %s\n", cudaGetErrorString(e));
@@ -2424,8 +2444,9 @@ int main(int argc, char** argv) {
             cudaDeviceProp prop{};
             cudaGetDeviceProperties(&prop, dev);
             std::fprintf(stderr, "strata generate: extra GPU %d (%s): %lld more experts, %.2f GiB (profile ranks %lld..%lld); "
-                                 "slot 0 verified\n", dev, prop.name, (long long) t->slots(),
-                         (double) t->bytes() / 1073741824.0, (long long) next, (long long) (next + t->slots() - 1));
+                                 "slot 0 verified; %s\n", dev, prop.name, (long long) t->slots(),
+                         (double) t->bytes() / 1073741824.0, (long long) next, (long long) (next + t->slots() - 1),
+                         t->zero_copy() ? "reads and writes the host rows in place" : "copies the rows each way");
             next += (size_t) t->slots();
             tiers.push_back(std::move(t));
         }
@@ -2435,9 +2456,13 @@ int main(int argc, char** argv) {
         tier_slots += t->slots();
         tier_bytes += t->bytes();
     }
+    // the bytes all the cards' adaptive swaps may copy per round: the main card's own allowance, shared
+    const int64_t adapt_budget = o.adapt_budget_mib > 0 ? (int64_t) o.adapt_budget_mib << 20
+                                 : (int64_t) o.adapt_swaps * (int64_t) strata::kernels::cpu::expert_layout().max_blob;
 
     Drive drive;
     for (const auto& t : tiers) drive.d.tiers.push_back(t.get());
+    drive.d.tier_min_entries = std::max(1, o.extra_gpu_min_entries);
     for (int r = 0; r < 3; ++r) if (o.expert_cache_remote[(size_t) r] > 0)
         drive.d.remote[drive.d.remote_count++] = &remote_experts[(size_t) r];
     drive.d.hit_cpu_order = o.expert_cache_cpu_order;
@@ -3451,6 +3476,7 @@ int main(int argc, char** argv) {
         }
         // plan v0.3 P6: swaps in flight - (residency index, slot) admitted when adapt_ev has completed
         std::vector<std::pair<int32_t, int32_t>> pending;
+        std::vector<std::pair<int, int32_t>> promoted;   // (tier, residency index): the card keeps it until then
         cudaEvent_t adapt_ev = nullptr;
         cudaEventCreateWithFlags(&adapt_ev, cudaEventDisableTiming);
         // a layer split's later stages keep a copy of the residency table on their devices, and swap on their own
@@ -3476,6 +3502,8 @@ int main(int argc, char** argv) {
             for (auto& st : stages) st->adapt_live = false;
             for (const auto& [i, slot] : pending) host_res[(size_t) i] = slot;
             pending.clear();
+            for (const auto& [t, i] : promoted) drive.d.tiers[(size_t) t]->release((size_t) i);
+            promoted.clear();
             res_upload();
             return true;
         };
@@ -3491,8 +3519,13 @@ int main(int argc, char** argv) {
                 const float* u = drive.d.usage.data() + l * g.n_expert;
                 const int32_t* r = host_res.data() + l * g.n_expert;
                 for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
-                    if (r[e] < 0) { if (u[e] >= 2.0f && !strata::core::held_by_tier(drive.d.tiers, l, e)) cand.emplace_back(u[e], e); }
-                    else vict.emplace_back(u[e], e);
+                    if (r[e] >= 0) { vict.emplace_back(u[e], e); continue; }
+                    if (u[e] < 2.0f) continue;
+                    // an expert an extra GPU holds is on a GPU already: it moves up only when routed clearly more
+                    // than the least-routed expert here (the card refills the slot it leaves behind)
+                    const int t = strata::core::tier_of(drive.d.tiers, l, e);
+                    if (t < 0 && strata::core::held_by_tier(drive.d.tiers, l, e)) continue;   // still arriving there
+                    cand.emplace_back(u[e] - (t >= 0 ? kPromoteBar : 0.0f), e);
                 }
                 if (cand.empty() || vict.empty()) continue;
                 std::sort(cand.begin(), cand.end(), [](auto& a, auto& b) { return a.first > b.first; });
@@ -3506,6 +3539,7 @@ int main(int argc, char** argv) {
             }
             std::sort(swaps.begin(), swaps.end(), [](const Swap& a, const Swap& b) { return a.gain > b.gain; });
             if ((int) swaps.size() > o.adapt_swaps) swaps.resize((size_t) o.adapt_swaps);
+            int64_t swapped_bytes = 0;
             bool main_live = false;
             for (const Swap& s : swaps) {
                 const size_t in = (size_t) s.layer * g.n_expert + s.in, out = (size_t) s.layer * g.n_expert + s.out;
@@ -3523,11 +3557,15 @@ int main(int argc, char** argv) {
                 else main_live = true;
                 host_res[out] = strata::core::kNotResident;   // evicted now: the CPU computes it meanwhile
                 pending.emplace_back((int32_t) in, slot);      // resident once the copy has landed
+                swapped_bytes += (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer);
+                if (const int t = strata::core::tier_of(drive.d.tiers, s.layer, s.in); t >= 0)
+                    promoted.emplace_back(t, (int32_t) in);    // the card computes it until then
             }
             if (!swaps.empty()) cudaEventRecord(adapt_ev, adapt_stream);
             {
                 std::string e2;
-                if (!strata::core::adapt_tiers(drive.d.tiers, drive.d.usage.data(), host_res, pending, *srcp, o.adapt_swaps, e2)) {
+                if (!strata::core::adapt_tiers(drive.d.tiers, drive.d.usage.data(), host_res, pending, *srcp, o.adapt_swaps,
+                                               adapt_budget - swapped_bytes, e2)) {
                     std::fprintf(stderr, "strata: %s\n", e2.c_str());
                     return false;
                 }
@@ -4417,18 +4455,15 @@ int main(int argc, char** argv) {
                          decode_ms > 0 ? 1000.0 * produced_n / decode_ms : 0.0, (long long) draft_accepted,
                          (long long) draft_offered, checks.size(), cancelled ? " (cancelled)" : "");
             if (!tiers.empty()) {   // cumulative over the process: routed entries by where they were computed
-                std::string per;
                 int64_t on_tiers = 0;
-                double waited = 0;
-                for (const auto& t : tiers) {
-                    per += (per.empty() ? "" : ", ") + std::to_string(t->entries) + " on GPU " + std::to_string(t->device());
-                    on_tiers += t->entries;
-                    waited += t->ms_wait;
-                }
-                std::fprintf(stderr, "strata serve: experts: %lld on the main GPU's cache, %lld on the extra GPUs (%s), %lld "
-                                     "on the CPU (the rest read over PCIe); waited %.0f ms for the extra GPUs\n",
-                             (long long) drive.d.cache_hits, (long long) on_tiers, per.c_str(),
-                             (long long) drive.d.multi_entries, waited);
+                for (const auto& t : tiers) on_tiers += t->entries;
+                std::fprintf(stderr, "strata serve: experts: %lld on the main GPU's cache, %lld on the extra GPUs, %lld "
+                                     "on the CPU (the rest read over PCIe)\n",
+                             (long long) drive.d.cache_hits, (long long) on_tiers, (long long) drive.d.multi_entries);
+                for (const auto& t : tiers)   // per card: its share, the host time it cost, what the swaps moved
+                    std::fprintf(stderr, "strata serve: extra GPU %d: %lld entries in %lld layers; staging %.0f ms, waited "
+                                         "%.0f ms after the CPU, refilled %.1f MiB\n", t->device(), (long long) t->entries,
+                                 (long long) t->launches, t->ms_launch, t->ms_wait, (double) t->refill_bytes / 1048576.0);
             }
             // the VRAM share of the experts the pool looked up while decoding; experts it sent over PCIe for the GPU
             // to read (--pcie-frac) are in neither count
@@ -4860,6 +4895,7 @@ int main(int argc, char** argv) {
         }
         // plan v0.3 P6: swaps in flight - (residency index, slot) admitted when adapt_ev has completed
         std::vector<std::pair<int32_t, int32_t>> pending;
+        std::vector<std::pair<int, int32_t>> promoted;   // (tier, residency index): the card keeps it until then
         cudaEvent_t adapt_ev = nullptr;
         cudaEventCreateWithFlags(&adapt_ev, cudaEventDisableTiming);
         auto apply_pending = [&](bool wait) -> bool {
@@ -4870,6 +4906,8 @@ int main(int argc, char** argv) {
             else if (cudaEventQuery(adapt_ev) != cudaSuccess) return true;
             for (const auto& [i, slot] : pending) host_res[(size_t) i] = slot;
             pending.clear();
+            for (const auto& [t, i] : promoted) drive.d.tiers[(size_t) t]->release((size_t) i);
+            promoted.clear();
             if (d_res != nullptr)
                 cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
             return true;
@@ -4889,8 +4927,13 @@ int main(int argc, char** argv) {
                 const float* u = drive.d.usage.data() + l * g.n_expert;
                 const int32_t* r = host_res.data() + l * g.n_expert;
                 for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
-                    if (r[e] < 0) { if (u[e] >= 2.0f && !strata::core::held_by_tier(drive.d.tiers, l, e)) cand.emplace_back(u[e], e); }
-                    else vict.emplace_back(u[e], e);
+                    if (r[e] >= 0) { vict.emplace_back(u[e], e); continue; }
+                    if (u[e] < 2.0f) continue;
+                    // an expert an extra GPU holds is on a GPU already: it moves up only when routed clearly more
+                    // than the least-routed expert here (the card refills the slot it leaves behind)
+                    const int t = strata::core::tier_of(drive.d.tiers, l, e);
+                    if (t < 0 && strata::core::held_by_tier(drive.d.tiers, l, e)) continue;   // still arriving there
+                    cand.emplace_back(u[e] - (t >= 0 ? kPromoteBar : 0.0f), e);
                 }
                 if (cand.empty() || vict.empty()) continue;
                 std::sort(cand.begin(), cand.end(), [](auto& a, auto& b) { return a.first > b.first; });
@@ -4904,6 +4947,7 @@ int main(int argc, char** argv) {
             }
             std::sort(swaps.begin(), swaps.end(), [](const Swap& a, const Swap& b) { return a.gain > b.gain; });
             if ((int) swaps.size() > o.adapt_swaps) swaps.resize((size_t) o.adapt_swaps);
+            int64_t swapped_bytes = 0;
             for (const Swap& s : swaps) {
                 const size_t in = (size_t) s.layer * g.n_expert + s.in, out = (size_t) s.layer * g.n_expert + s.out;
                 const int32_t slot = host_res[out];
@@ -4917,11 +4961,15 @@ int main(int argc, char** argv) {
                 }
                 host_res[out] = strata::core::kNotResident;   // evicted now: the CPU computes it meanwhile
                 pending.emplace_back((int32_t) in, slot);      // resident once the copy has landed
+                swapped_bytes += (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer);
+                if (const int t = strata::core::tier_of(drive.d.tiers, s.layer, s.in); t >= 0)
+                    promoted.emplace_back(t, (int32_t) in);    // the card computes it until then
             }
             if (!swaps.empty()) cudaEventRecord(adapt_ev, adapt_stream);
             {
                 std::string e2;
-                if (!strata::core::adapt_tiers(drive.d.tiers, drive.d.usage.data(), host_res, pending, *srcp, o.adapt_swaps, e2)) {
+                if (!strata::core::adapt_tiers(drive.d.tiers, drive.d.usage.data(), host_res, pending, *srcp, o.adapt_swaps,
+                                               adapt_budget - swapped_bytes, e2)) {
                     std::fprintf(stderr, "strata: %s\n", e2.c_str());
                     return false;
                 }

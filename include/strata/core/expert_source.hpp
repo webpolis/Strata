@@ -245,8 +245,10 @@ struct ExpertDispatch {
     /// each layer's distinct missed experts (the last ones in routing order) are read by the GPU over PCIe.
     GpuPlanSink* plan = nullptr;
     /// Extra GPUs holding the experts ranked after the VRAM tier, in order: their resident experts are computed
-    /// there instead of on the CPU or over PCIe.
+    /// there instead of on the CPU or over PCIe - per layer, only when at least `tier_min_entries` of the window's
+    /// entries route to a card (fewer are not worth its launch and round trip).
     std::vector<GpuTier*> tiers;
+    int tier_min_entries = 1;
     int pcie_num = 0;
     int64_t pcie_experts = 0;      ///< distinct experts the GPU read over PCIe in verify windows
     double ms_plan = 0, ms_actq = 0, ms_jobs = 0, ms_run = 0;   ///< verify-window dispatch sections

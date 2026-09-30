@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 
 namespace strata::core {
@@ -67,8 +68,8 @@ bool GpuTier::open(int device, int home, int64_t n_layers, int64_t n_expert, int
                     cudaStreamCreateWithFlags(&as, cudaStreamNonBlocking) == cudaSuccess &&
                     cudaEventCreateWithFlags(&d, cudaEventDisableTiming) == cudaSuccess &&
                     cudaEventCreateWithFlags(&ae, cudaEventDisableTiming) == cudaSuccess &&
-                    cudaHostAlloc((void**) &h_in_, in_bytes, cudaHostAllocPortable) == cudaSuccess &&
-                    cudaHostAlloc((void**) &h_out_, out_bytes, cudaHostAllocPortable) == cudaSuccess &&
+                    cudaHostAlloc((void**) &h_in_, in_bytes, cudaHostAllocPortable | cudaHostAllocMapped) == cudaSuccess &&
+                    cudaHostAlloc((void**) &h_out_, out_bytes, cudaHostAllocPortable | cudaHostAllocMapped) == cudaSuccess &&
                     cudaMalloc((void**) &d_in_, in_bytes) == cudaSuccess &&
                     cudaMalloc((void**) &d_out_, out_bytes) == cudaSuccess &&
                     cudaMalloc((void**) &d_xq_, (size_t) max_tok * (size_t) (n_embd / 32) * 36) == cudaSuccess &&
@@ -82,8 +83,16 @@ bool GpuTier::open(int device, int home, int64_t n_layers, int64_t n_expert, int
         return false;
     }
     std::memset(h_in_, 0, in_bytes);
+    // Zero-copy: the card reads the activations from, and writes its rows into, the pinned host blocks directly -
+    // two copies fewer per layer, each a PCIe round trip the host had to start.  STRATA_TIER_ZEROCOPY=0 copies.
+    const char* zc = std::getenv("STRATA_TIER_ZEROCOPY");
+    zero_copy_ = !(zc && zc[0] == '0') &&
+                 cudaHostGetDevicePointer((void**) &z_in_, h_in_, 0) == cudaSuccess &&
+                 cudaHostGetDevicePointer((void**) &z_out_, h_out_, 0) == cudaSuccess;
+    cudaGetLastError();
     res_.assign((size_t) (n_layers * n_expert), kNotResident);
     incoming_.assign(res_.size(), 0);
+    free_.assign((size_t) n_layers, {});
     row_of_.assign((size_t) cap, 0);
     return true;
 }
@@ -145,13 +154,22 @@ void GpuTier::close() {
         if (stream_) cudaStreamDestroy((cudaStream_t) stream_);
         if (adapt_stream_) cudaStreamDestroy((cudaStream_t) adapt_stream_);
     }
-    d_in_ = h_in_ = d_xq_ = nullptr;
-    d_out_ = h_out_ = nullptr;
+    d_in_ = h_in_ = z_in_ = d_xq_ = nullptr;
+    d_out_ = h_out_ = z_out_ = nullptr;
     d_scratch_ = stream_ = adapt_stream_ = done_ = adapt_ev_ = nullptr;
+    zero_copy_ = false;
     res_.clear();
     incoming_.clear();
+    free_.clear();
     pending_.clear();
     dev_ = -1;
+}
+
+void GpuTier::release(size_t i) {
+    const int32_t slot = res_[i];
+    if (slot < 0) return;
+    res_[i] = kNotResident;
+    free_[(size_t) ((int64_t) i / n_expert_)].push_back(slot);
 }
 
 void GpuTier::begin(int64_t layer) {
@@ -178,6 +196,7 @@ void GpuTier::add_entry(int32_t routed, int32_t tok) {
 bool GpuTier::launch(const float* x, int64_t n_tok, std::string& err) {
     if (ng_ == 0) return true;
     if (n_tok > max_tok_ || ne_ > cap_) { err = "a verify window is larger than the extra GPU's buffers"; return false; }
+    const auto t0 = std::chrono::steady_clock::now();
     auto* counts = (int32_t*) h_in_;
     counts[0] = ng_;
     counts[1] = ne_;
@@ -192,23 +211,29 @@ bool GpuTier::launch(const float* x, int64_t n_tok, std::string& err) {
         return false;
     }
     cudaStream_t s = (cudaStream_t) stream_;
-    if (const cudaError_t e = cudaMemcpyAsync(d_in_, h_in_, off_x_ + xb, cudaMemcpyHostToDevice, s); e != cudaSuccess) {
+    // the plan (a few KB) always goes over in one copy: the kernel reads it per group and per entry
+    if (const cudaError_t e = cudaMemcpyAsync(d_in_, h_in_, zero_copy_ ? off_x_ : off_x_ + xb, cudaMemcpyHostToDevice, s);
+        e != cudaSuccess) {
         err = std::string("copying to the extra GPU: ") + cudaGetErrorString(e);
         return false;
     }
-    strata::kernels::quantize_q8_1_rows((const float*) (d_in_ + off_x_), n_tok, n_embd_, d_xq_, s);
+    strata::kernels::quantize_q8_1_rows((const float*) ((zero_copy_ ? z_in_ : d_in_) + off_x_), n_tok, n_embd_, d_xq_, s);
     strata::kernels::native_expert_grouped(L, (const unsigned long long*) (d_in_ + off_ptr_),
                                            (const int32_t*) (d_in_ + off_start_), (const int32_t*) d_in_,
                                            (const int32_t*) (d_in_ + off_dst_), (const int32_t*) (d_in_ + off_tok_), ng_,
-                                           ne_, d_xq_, d_scratch_, d_out_, s);
-    if (const cudaError_t e = cudaMemcpyAsync(h_out_, d_out_, (size_t) ne_ * (size_t) n_embd_ * sizeof(float),
-                                              cudaMemcpyDeviceToHost, s); e != cudaSuccess) {
-        err = std::string("copying from the extra GPU: ") + cudaGetErrorString(e);
-        return false;
+                                           ne_, d_xq_, d_scratch_, zero_copy_ ? z_out_ : d_out_, s);
+    if (!zero_copy_) {
+        if (const cudaError_t e = cudaMemcpyAsync(h_out_, d_out_, (size_t) ne_ * (size_t) n_embd_ * sizeof(float),
+                                                  cudaMemcpyDeviceToHost, s); e != cudaSuccess) {
+            err = std::string("copying from the extra GPU: ") + cudaGetErrorString(e);
+            return false;
+        }
     }
     const cudaError_t e = cudaEventRecord((cudaEvent_t) done_, s);
     if (e != cudaSuccess) { err = std::string("the extra GPU: ") + cudaGetErrorString(e); return false; }
     launched_ = true;
+    ++launches;
+    ms_launch += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     return true;
 }
 
@@ -233,9 +258,13 @@ bool GpuTier::finish(float* out, std::string& err) {
     return true;
 }
 
-int GpuTier::adapt(const float* usage, std::vector<uint8_t>& held, ExpertSource& src, int max_swaps, std::string& err) {
-    if (!pending_.empty()) return 0;   // the previous swaps are still copying
-    struct Swap { float gain; int32_t layer, in, out; };
+int64_t GpuTier::adapt(const float* usage, std::vector<uint8_t>& held, ExpertSource& src, int max_swaps,
+                       int64_t max_bytes, std::string& err) {
+    if (!pending_.empty() || max_swaps <= 0 || max_bytes <= 0) return 0;   // the previous swaps are still copying
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    // A swap's gain is the routing it takes off the CPU: a freed slot (the main card took its expert) costs nothing
+    // to fill, so a candidate for it needs no victim to beat; otherwise it must beat this card's least-routed one.
+    struct Swap { float gain; int32_t layer, in, out; };   // out < 0: a freed slot
     std::vector<Swap> swaps;
     std::vector<std::pair<float, int32_t>> cand, vict;
     for (int64_t l = 0; l < n_layers_; ++l) {
@@ -247,35 +276,53 @@ int GpuTier::adapt(const float* usage, std::vector<uint8_t>& held, ExpertSource&
             if (res_[i] >= 0) vict.emplace_back(usage[i], e);
             else if (!held[i] && usage[i] >= 2.0f) cand.emplace_back(usage[i], e);
         }
-        if (cand.empty() || vict.empty()) continue;
+        if (cand.empty()) continue;
         std::sort(cand.begin(), cand.end(), [](auto& x, auto& y) { return x.first > y.first; });
-        const size_t nc = std::min(cand.size(), vict.size());
+        size_t c = 0;
+        for (; c < cand.size() && c < free_[(size_t) l].size(); ++c)
+            swaps.push_back({cand[c].first, (int32_t) l, cand[c].second, -1});
+        if (c >= cand.size() || vict.empty()) continue;
+        const size_t nc = std::min(cand.size() - c, vict.size());
         std::partial_sort(vict.begin(), vict.begin() + (ptrdiff_t) nc, vict.end(),
                           [](auto& x, auto& y) { return x.first < y.first; });
         for (size_t i = 0; i < nc; ++i) {
-            if (cand[i].first < vict[i].first + 1.5f) break;
-            swaps.push_back({cand[i].first - vict[i].first, (int32_t) l, cand[i].second, vict[i].second});
+            if (cand[c + i].first < vict[i].first + 1.5f) break;
+            swaps.push_back({cand[c + i].first - vict[i].first, (int32_t) l, cand[c + i].second, vict[i].second});
         }
     }
     std::sort(swaps.begin(), swaps.end(), [](const Swap& x, const Swap& y) { return x.gain > y.gain; });
     if ((int) swaps.size() > max_swaps) swaps.resize((size_t) max_swaps);
+    int64_t bytes = 0;
+    size_t n = 0;
+    for (; n < swaps.size(); ++n) {   // the byte budget: shared by every card's swaps this round
+        const int64_t b = (int64_t) lay.blob_bytes(swaps[n].layer);
+        if (bytes + b > max_bytes) break;
+        bytes += b;
+    }
+    swaps.resize(n);
     if (swaps.empty()) return 0;
-    const auto& lay = strata::kernels::cpu::expert_layout();
     OnDevice on(dev_, home_);
     if (on.status != cudaSuccess) {
         err = "cannot select extra GPU " + std::to_string(dev_) + ": " + cudaGetErrorString(on.status);
         return -1;
     }
     for (const Swap& s : swaps) {
-        const size_t in = (size_t) s.layer * n_expert_ + s.in, out = (size_t) s.layer * n_expert_ + s.out;
-        const int32_t slot = res_[out];
+        const size_t in = (size_t) s.layer * n_expert_ + s.in;
+        int32_t slot;
+        if (s.out < 0) {
+            slot = free_[(size_t) s.layer].back();
+            free_[(size_t) s.layer].pop_back();
+        } else {
+            const size_t out = (size_t) s.layer * n_expert_ + s.out;
+            slot = res_[out];
+            res_[out] = kNotResident;   // evicted now: the CPU computes it meanwhile
+        }
         const uint8_t* blob = src.blob(s.layer, s.in);
         if (blob == nullptr || cudaMemcpyAsync(cache_.device_slot(slot), blob, (size_t) lay.blob_bytes(s.layer),
                                                cudaMemcpyHostToDevice, (cudaStream_t) adapt_stream_) != cudaSuccess) {
             err = "an adaptive refill of an extra GPU failed";
             return -1;
         }
-        res_[out] = kNotResident;   // evicted now: the CPU computes it meanwhile
         incoming_[in] = 1;
         held[in] = 1;
         pending_.emplace_back((int32_t) in, slot);
@@ -284,7 +331,8 @@ int GpuTier::adapt(const float* usage, std::vector<uint8_t>& held, ExpertSource&
         err = std::string("recording the extra GPU refill: ") + cudaGetErrorString(e);
         return -1;
     }
-    return (int) swaps.size();
+    refill_bytes += (uint64_t) bytes;
+    return bytes;
 }
 
 bool GpuTier::apply(bool wait, std::string& err) {
@@ -325,16 +373,20 @@ bool held_by_tier(const std::vector<GpuTier*>& tiers, int64_t layer, int32_t e) 
 
 bool adapt_tiers(const std::vector<GpuTier*>& tiers, const float* usage, const std::vector<int32_t>& main_res,
                  const std::vector<std::pair<int32_t, int32_t>>& main_incoming, ExpertSource& src, int max_swaps,
-                 std::string& err) {
-    if (tiers.empty()) return true;
+                 int64_t budget_bytes, std::string& err) {
+    if (tiers.empty() || budget_bytes <= 0) return true;
     std::vector<uint8_t> held(main_res.size(), 0);
     for (size_t i = 0; i < main_res.size(); ++i) held[i] = main_res[i] >= 0;
     for (const auto& pr : main_incoming) held[(size_t) pr.first] = 1;
     for (const GpuTier* t : tiers)
         for (size_t i = 0; i < held.size(); ++i)
             if (t->holds_at(i)) held[i] = 1;
-    for (GpuTier* t : tiers)
-        if (t->adapt(usage, held, src, max_swaps, err) < 0) return false;
+    for (GpuTier* t : tiers) {
+        const int64_t used = t->adapt(usage, held, src, max_swaps, budget_bytes, err);
+        if (used < 0) return false;
+        budget_bytes -= used;
+        if (budget_bytes <= 0) break;
+    }
     return true;
 }
 

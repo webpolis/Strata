@@ -119,10 +119,8 @@ def run(cfg: dict, say=print, start_engine=None) -> dict:
     tok = ST.Tokenizer(toks, (tpath / "merges.txt").read_text(encoding="utf-8").split("\n"),
                        json.loads((tpath / "token_type.json").read_text()))
     ids_list = [chat_ids(tok, p) for p in PROMPTS]
-    args = list(cfg["args"])
-    if isinstance(cfg.get("gpu"), list) and "--layer-split" not in args:   # several cards: measured as it runs
-        args += ["--layer-split", str(cfg.get("layer_split") or "auto")]
-    return measure(args, ids_list, start_engine, say)
+    from serve.server import engine_args
+    return measure(engine_args(cfg), ids_list, start_engine, say)   # as the server starts it: layer split, extra GPUs
 
 
 def measure(base_args: list[str], ids_list, start_engine, say=print) -> dict:
@@ -190,6 +188,27 @@ def measure(base_args: list[str], ids_list, start_engine, say=print) -> dict:
             base_rate = statistics.median(by_workers[w_best])
         elif by_workers.get(d_workers):
             base_rate = statistics.median(by_workers[d_workers])
+    # 5. the extra GPUs' expert caches off (a restart each): a card's per-layer round trips can cost more than the
+    # CPU work they save, so it is kept only when the measurement says so
+    if "--extra-gpus" in base_args:
+        tuned = apply(base_args, settings)
+        alone = [a for a in with_arg(with_arg(tuned, "--extra-gpus", None), "--extra-gpu-reserve-mib", None)
+                 if a != "--extra-gpus-optional"]
+        by_extra = {}
+        for key, args in (("on", tuned), ("off", alone)):
+            say(f"  Measuring with the extra GPUs {key} (restarts the engine) ...")
+            e = start_engine(args)
+            try:
+                se = Session(e, ids_list)
+                se.warm_up(1)
+                by_extra[key] = [se.rate(), se.rate()]
+                say(f"    extra GPUs {key}: {statistics.median(by_extra[key]):.1f} tok/s")
+            finally:
+                close(e)
+        report["extra_gpus"] = by_extra
+        if pick(by_extra, "on") == "off":
+            settings["extra_gpus"] = "off"
+        base_rate = statistics.median(by_extra["off" if settings.get("extra_gpus") == "off" else "on"])
     report["seconds"] = round(time.time() - t0)
     report["tok_s"] = round(base_rate, 1) if base_rate else None
     return {"settings": settings, "report": report}
@@ -219,6 +238,14 @@ def apply(args: list[str], settings: dict) -> list[str]:
     for flag, default in DEFAULTS.items():
         out = with_arg(out, flag, settings.get(flag, default))
     return out
+
+
+def apply_config(cfg: dict, settings: dict) -> None:
+    """The calibrated settings into a run config: its engine arguments, and the extra GPUs' expert caches dropped
+    when the measurement found the model faster without them (setup --setup finds the cards again)."""
+    cfg["args"] = apply(cfg["args"], settings)
+    if settings.get("extra_gpus") == "off":
+        cfg.pop("extra_gpus", None)
 
 
 if __name__ == "__main__":

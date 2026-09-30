@@ -825,13 +825,30 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             first_of[i] = i;
             for (int64_t j = 0; j < i; ++j)
                 if (ids[j] == ids[i]) { first_of[i] = first_of[j]; break; }
-            if (first_of[i] == i) {
-                distinct[nd++] = i;
-                const int32_t e = ids[i];
-                if (e >= 0 && e < d.n_expert && d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] < 0 &&
-                    tier_of(d.tiers, d.layers, e) < 0)
-                    ++nmiss;
-            }
+            if (first_of[i] == i) distinct[nd++] = i;
+        }
+        // An extra GPU takes a layer only when at least `tier_min_entries` of the window's entries route to experts
+        // it holds: below that its launch and round trip cost more than they take off the CPU, and those entries
+        // stay on the CPU (or the PCIe share).
+        int tier_entries[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        int8_t tier_of_distinct[kMaxWindowEntries];
+        for (int q = 0; q < nd; ++q) {
+            const int64_t i0 = distinct[q];
+            const int32_t e = ids[i0];
+            int t = -1;
+            if (e >= 0 && e < d.n_expert && d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] < 0)
+                t = tier_of(d.tiers, d.layers, e);
+            tier_of_distinct[q] = (int8_t) t;
+            if (t >= 0)
+                for (int64_t i = i0; i < n; ++i)
+                    if (first_of[i] == i0) ++tier_entries[t];
+        }
+        for (int q = 0; q < nd; ++q) {
+            const int32_t e = ids[distinct[q]];
+            if (tier_of_distinct[q] >= 0 && tier_entries[tier_of_distinct[q]] < d.tier_min_entries) tier_of_distinct[q] = -1;
+            if (e >= 0 && e < d.n_expert && d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] < 0 &&
+                tier_of_distinct[q] < 0)
+                ++nmiss;
         }
         const bool pcie_ok = d.pcie_num > 0 && d.src->device_alias(d.layers, 0) != nullptr;
         const int m = pcie_ok ? (nmiss * d.pcie_num) >> 8 : 0;
@@ -851,8 +868,8 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                     kd = 0;
                     ptr = (unsigned long long) (d.cache_base + (d.cache_slot_off ? (size_t) d.cache_slot_off[slot]
                                                                                  : (size_t) slot * (size_t) d.cache_blob));
-                } else if (const int t = tier_of(d.tiers, d.layers, e); t >= 0) {
-                    kd = 3 + t;
+                } else if (tier_of_distinct[q] >= 0) {
+                    kd = 3 + tier_of_distinct[q];
                 } else {
                     if (miss_rank >= nmiss - m && fetches < P.staging_cap && fetches < 64) {
                         const uint8_t* src = d.src->blob(d.layers, e);
@@ -936,13 +953,24 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         }
     }
     const auto c1 = std::chrono::steady_clock::now();
-    if (native && lay.fmt[(size_t) d.layers].gu_type == 42)   // a native Q2_0 pack: the Q2_0 kernels' activations
-        for (int64_t t = 0; t < n_tok; ++t) act_quant_any(x_f + (size_t) t * H, H, d.act_multi[(size_t) t]);
-    else if (native)
+    // the CPU's activations: only the tokens with an entry the CPU computes (a token whose experts all run on a
+    // GPU needs none, and the more the GPUs hold the more tokens that is)
+    bool cpu_tok[MAXT];
+    for (int64_t t = 0; t < n_tok; ++t) {
+        cpu_tok[t] = false;
+        for (int64_t j = 0; j < k && !cpu_tok[t]; ++j) cpu_tok[t] = kind[t * k + j] < 0;
+    }
+    if (native && lay.fmt[(size_t) d.layers].gu_type == 42) {   // a native Q2_0 pack: the Q2_0 kernels' activations
         for (int64_t t = 0; t < n_tok; ++t)
-            native_quant_act(lay.fmt[(size_t) d.layers], x_f + (size_t) t * H, d.nact_multi.data() + (size_t) t * kNativeActBytes);
-    else
-        for (int64_t t = 0; t < n_tok; ++t) act_quant_q8_1(x_f + (size_t) t * H, H, d.act_multi[(size_t) t]);
+            if (cpu_tok[t]) act_quant_any(x_f + (size_t) t * H, H, d.act_multi[(size_t) t]);
+    } else if (native) {
+        for (int64_t t = 0; t < n_tok; ++t)
+            if (cpu_tok[t])
+                native_quant_act(lay.fmt[(size_t) d.layers], x_f + (size_t) t * H, d.nact_multi.data() + (size_t) t * kNativeActBytes);
+    } else {
+        for (int64_t t = 0; t < n_tok; ++t)
+            if (cpu_tok[t]) act_quant_q8_1(x_f + (size_t) t * H, H, d.act_multi[(size_t) t]);
+    }
     const auto c2 = std::chrono::steady_clock::now();
     int njobs = 0;
     for (int64_t t = 0; t < n_tok; ++t)

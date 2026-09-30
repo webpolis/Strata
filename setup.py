@@ -1406,7 +1406,7 @@ def calibrate_config(cfg_path: Path) -> bool:
     except Exception as e:                             # never stops an install: the defaults stay
         warn(f"the tuning did not finish ({e}): the default settings stay")
         return False
-    cfg["args"] = CAL.apply(cfg["args"], res["settings"])
+    CAL.apply_config(cfg, res["settings"])
     cfg_path.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
     st = load_settings()
     st.setdefault("calibration", {})[hardware_key(cfg)] = {"settings": res["settings"], "tok_s": res["report"].get("tok_s"),
@@ -2124,7 +2124,7 @@ def main() -> int:
     if cal is not None:
         sys.path.insert(0, str(ROOT / "tools"))
         import calibrate as CAL
-        cfg["args"] = CAL.apply(cfg["args"], cal.get("settings") or {})
+        CAL.apply_config(cfg, cal.get("settings") or {})
         ok("the settings tuned for this PC earlier are used" + (f" ({cal['date']})" if cal.get("date") else ""))
     cfg_path.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
     script = write_run_script(tag, cfg_path, port)
