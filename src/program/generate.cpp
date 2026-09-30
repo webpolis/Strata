@@ -2456,7 +2456,8 @@ int main(int argc, char** argv) {
         tier_slots += t->slots();
         tier_bytes += t->bytes();
     }
-    // the bytes all the cards' adaptive swaps may copy per round: the main card's own allowance, shared
+    // the bytes all the cards' adaptive swaps may copy per round: the main card's own allowance, shared; the extra
+    // cards keep a quarter of it whatever the main card moved, so the slots its promotions free are refilled
     const int64_t adapt_budget = o.adapt_budget_mib > 0 ? (int64_t) o.adapt_budget_mib << 20
                                  : (int64_t) o.adapt_swaps * (int64_t) strata::kernels::cpu::expert_layout().max_blob;
 
@@ -3565,7 +3566,7 @@ int main(int argc, char** argv) {
             {
                 std::string e2;
                 if (!strata::core::adapt_tiers(drive.d.tiers, drive.d.usage.data(), host_res, pending, *srcp, o.adapt_swaps,
-                                               adapt_budget - swapped_bytes, e2)) {
+                                               std::max(adapt_budget - swapped_bytes, adapt_budget / 4), e2)) {
                     std::fprintf(stderr, "strata: %s\n", e2.c_str());
                     return false;
                 }
@@ -4969,7 +4970,7 @@ int main(int argc, char** argv) {
             {
                 std::string e2;
                 if (!strata::core::adapt_tiers(drive.d.tiers, drive.d.usage.data(), host_res, pending, *srcp, o.adapt_swaps,
-                                               adapt_budget - swapped_bytes, e2)) {
+                                               std::max(adapt_budget - swapped_bytes, adapt_budget / 4), e2)) {
                     std::fprintf(stderr, "strata: %s\n", e2.c_str());
                     return false;
                 }

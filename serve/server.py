@@ -489,8 +489,11 @@ def gpu_list(cfg: dict) -> list[int]:
 
 
 def extra_gpus(cfg: dict) -> list[int]:
-    """The config's "extra_gpus": cards that hold more expert caches beside the ones the model runs on, numbered as
-    nvidia-smi numbers them; [] when it names none."""
+    """The config's "extra_gpus": cards that hold more expert caches beside the one the model runs on, numbered as
+    nvidia-smi numbers them; [] when it names none, when the calibration switched them off ("extra_gpus_off"), or
+    with a layer split (its stages take every visible card, and the engine refuses the two together)."""
+    if cfg.get("extra_gpus_off") or len(gpu_list(cfg)) > 1:
+        return []
     return [int(x) for x in cfg.get("extra_gpus") or []]
 
 

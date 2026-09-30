@@ -1501,8 +1501,9 @@ def start(cfg_path: Path, port: int | None, gpu: int | list | None = None, open_
     elif isinstance(use, list):
         check_gpus(use, found, "(chosen for this model) ")
         byid = {g["index"]: g for g in found}
-        extras = keep_extras(cfg_path, cfg, found, use) if gpu is None else []
-        cfg = ensure_engine_for([byid[i] for i in use] + extras, cfg_path, cfg, yes)
+        keep_extras(cfg_path, cfg, found, [g["index"] for g in found])   # a layer split takes every card
+        extras = []
+        cfg = ensure_engine_for([byid[i] for i in use], cfg_path, cfg, yes)
         ok("GPUs: " + " + ".join(gpu_name(byid[i]) for i in use) + f" together (layers split {cfg.get('layer_split') or 'auto'})")
     elif found:
         g = next((x for x in found if x["index"] == use), None) if use is not None else max(
@@ -1512,7 +1513,8 @@ def start(cfg_path: Path, port: int | None, gpu: int | list | None = None, open_
             cfg = ensure_engine_for([g] + extras, cfg_path, cfg, yes)
             ok("GPU: " + gpu_name(g))
     for g in extras:
-        ok("extra expert cache: " + gpu_name(g))
+        ok("extra expert cache: " + gpu_name(g) + (" (off: the tuning found the model faster without it; "
+                                                  "START-HERE --calibrate measures it again)" if cfg.get("extra_gpus_off") else ""))
     if open_browser:
         cmd.append("--open")
     gb = 0.0
@@ -1559,7 +1561,7 @@ def refresh_draft_vocab(rt: Path, choice: str = "cjk") -> None:
 
 def keep_extras(cfg_path: Path, cfg: dict, found, used) -> list:
     """The cards the config keeps extra expert caches on, less any that is gone or now runs the model (a layer split
-    accepted since); the config is updated when the list changed."""
+    accepted since takes them all); the config is updated when the list changed."""
     byid = {g["index"]: g for g in found}
     keep = [i for i in cfg.get("extra_gpus") or [] if i in byid and i not in used]
     if (cfg.get("extra_gpus") or []) != keep:
@@ -1780,7 +1782,7 @@ def main() -> int:
         GPU_PICK = a.gpu
         gpu = gpu_info(a.gpu)
         chosen = [gpu_info(i) for i in sel]
-        extras = extra_gpus(found, sel) if a.extra_gpus == "auto" else []
+        extras = extra_gpus(found, sel) if a.extra_gpus == "auto" and not multi else []
         gpu["archs"] = sorted({x["arch"] for x in chosen + extras})  # the engine needs code for every one of them
         for x in extras:
             ok(f"extra GPU: {gpu_name(x)} - one more expert cache, its experts computed there instead of on the CPU")

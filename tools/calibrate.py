@@ -120,7 +120,8 @@ def run(cfg: dict, say=print, start_engine=None) -> dict:
                        json.loads((tpath / "token_type.json").read_text()))
     ids_list = [chat_ids(tok, p) for p in PROMPTS]
     from serve.server import engine_args
-    return measure(engine_args(cfg), ids_list, start_engine, say)   # as the server starts it: layer split, extra GPUs
+    base = {k: v for k, v in cfg.items() if k != "extra_gpus_off"}   # an earlier verdict is measured again
+    return measure(engine_args(base), ids_list, start_engine, say)   # as the server starts it: layer split, extra GPUs
 
 
 def measure(base_args: list[str], ids_list, start_engine, say=print) -> dict:
@@ -241,11 +242,14 @@ def apply(args: list[str], settings: dict) -> list[str]:
 
 
 def apply_config(cfg: dict, settings: dict) -> None:
-    """The calibrated settings into a run config: its engine arguments, and the extra GPUs' expert caches dropped
-    when the measurement found the model faster without them (setup --setup finds the cards again)."""
+    """The calibrated settings into a run config: its engine arguments, and the extra GPUs' expert caches switched
+    off when the measurement found the model faster without them (the cards stay in the config: the next
+    calibration measures them again)."""
     cfg["args"] = apply(cfg["args"], settings)
     if settings.get("extra_gpus") == "off":
-        cfg.pop("extra_gpus", None)
+        cfg["extra_gpus_off"] = True
+    else:
+        cfg.pop("extra_gpus_off", None)
 
 
 if __name__ == "__main__":

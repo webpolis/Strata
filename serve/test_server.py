@@ -362,10 +362,12 @@ class GpuChoice(unittest.TestCase):
         tiers = {"gpu": 0, "extra_gpus": [2, 1], "args": ["--pack", "pack"]}
         self.assertEqual(child_env(tiers)["CUDA_VISIBLE_DEVICES"], "0,2,1")
         self.assertEqual(engine_args(tiers), ["--pack", "pack", "--extra-gpus", "1,2", "--extra-gpus-optional"])
-        split = {"gpu": [0, 2], "extra_gpus": [1], "args": ["--pack", "pack"]}
-        self.assertEqual(child_env(split)["CUDA_VISIBLE_DEVICES"], "0,2,1")
-        self.assertEqual(engine_args(split), ["--pack", "pack", "--layer-split", "auto", "--extra-gpus", "2",
-                                              "--extra-gpus-optional"])
+        off = dict(tiers, extra_gpus_off=True)    # the calibration found the model faster without them
+        self.assertEqual(child_env(off)["CUDA_VISIBLE_DEVICES"], "0")
+        self.assertEqual(engine_args(off), ["--pack", "pack"])
+        split = {"gpu": [0, 2], "extra_gpus": [1], "args": ["--pack", "pack"]}   # a layer split takes every card
+        self.assertEqual(child_env(split)["CUDA_VISIBLE_DEVICES"], "0,2")
+        self.assertEqual(engine_args(split), ["--pack", "pack", "--layer-split", "auto"])
         plain = child_env({})                     # no choice: the environment as it was (existing installs)
         self.assertEqual(plain.get("CUDA_VISIBLE_DEVICES"), os.environ.get("CUDA_VISIBLE_DEVICES"))
         self.assertEqual(plain.get("CUDA_DEVICE_ORDER"), os.environ.get("CUDA_DEVICE_ORDER"))
