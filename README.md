@@ -13,9 +13,44 @@ of a word): faster than you can read.
 
 - **Free and open source.**
 
-> **Jump to:** [How fast?](#how-fast-is-it) · [Which model?](#which-model-should-i-pick) · [Install](#install) ·
-> [Using it](#using-it) · [Problems?](#something-went-wrong) · [How it works](#how-does-it-work) ·
+> **Jump to:** [This fork](#what-this-fork-adds) · [How fast?](#how-fast-is-it) · [Which model?](#which-model-should-i-pick) ·
+> [Install](#install) · [Using it](#using-it) · [Problems?](#something-went-wrong) · [How it works](#how-does-it-work) ·
 > [All the details](docs/DETAILS.md)
+
+---
+
+## What this fork adds
+
+This fork of [Niko1221/Strata](https://github.com/Niko1221/Strata) follows its `main` and adds one feature: **spare
+NVIDIA cards hold more of the model's [experts](#how-does-it-work) and compute them**, so fewer are left to the
+processor.
+
+```mermaid
+flowchart LR
+    subgraph up["Upstream"]
+        direction TB
+        a1["Main GPU<br/>busiest experts"] --> a2["CPU + RAM<br/>all the rest"]
+    end
+    subgraph fork["This fork"]
+        direction TB
+        b1["Main GPU<br/>busiest experts"] --> b2["Extra GPUs<br/>the next busiest"] --> b3["CPU + RAM<br/>all the rest"]
+    end
+    up ~~~ fork
+    classDef added fill:#1f883d,stroke:#1f883d,color:#fff
+    class b2 added
+```
+
+| | Upstream | This fork |
+| --- | --- | --- |
+| **Other NVIDIA cards** | Share the model's layers (RTX 20 or newer, 8 GB or more each) | The same, or each one holds extra experts for the main card (RTX 20 or newer, 4 GB or more, up to 8 cards) |
+| **Setup** | Asks whether to share the layers | Also turns spare cards into expert caches by itself; `--extra-gpus off` leaves them alone |
+| **`--calibrate`** | Tunes the engine settings | Also times the model with and without the extra cards, and keeps the faster |
+| **Driver older than 580** | Setup stops | Setup compiles the engine with a CUDA 12 toolkit |
+| **RAM on Linux** | 4 KB pages unless you set up a huge-page pool | 2 MB pages with no setup (transparent huge pages) |
+
+**The cost:** with extra cards, setup compiles the engine on your PC (it installs the build tools) instead of
+downloading a ready-made one. Extra cards don't combine with a layer split, and the Q2_0 size on a processor with
+AVX-512 can't use them.
 
 ---
 
@@ -98,7 +133,7 @@ App). Everything else - Python, the engine, the model - is set up for you.
 
 **Windows**
 
-1. [Download this project](https://github.com/Niko1221/Strata/archive/refs/heads/main.zip) and unzip it (or `git clone` it).
+1. [Download this project](https://github.com/webpolis/Strata/archive/refs/heads/main.zip) and unzip it (or `git clone` it).
 2. Double-click **`START-HERE.bat`**.
 3. Answer a few questions - or just press Enter each time for the recommended choice:
    - **Which model and size?** The original or Swift 1.5, and Q2_0, IQ2_XS, IQ3_XXS or IQ3_S - see [above](#which-model-should-i-pick)
