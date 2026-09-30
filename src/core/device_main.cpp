@@ -1,7 +1,8 @@
 // src/core/device_main.cpp - `strata-device`: report the GPU, the plan, and exercise the arena.
 //
 // This is P2.S1's "startup prints the memory plan vs actual cudaMemGetInfo" bullet, on its own so it can run
-// without the model.  It also checks that the selected main GPU supports compute capability 8.0 or newer.
+// without the model.  It is also the run-time half of the sm_120 policy: CMake refuses to COMPILE for another
+// architecture, and this refuses to RUN on one.
 #include "strata/core/device.hpp"
 #include "strata/plan/plan.hpp"
 
@@ -32,7 +33,11 @@ int main(int argc, char** argv) {
     try {
         const strata::core::DeviceInfo d = strata::core::device_info(0);
         std::printf("device %d: %s\n", d.ordinal, d.name.c_str());
+#if defined(STRATA_USE_HIP)
+        std::printf("  HIP target          gfx1100 wave32\n");
+#else
         std::printf("  compute capability  %d.%d   (sm_%d%d)\n", d.cc_major, d.cc_minor, d.cc_major, d.cc_minor);
+#endif
         std::printf("  multiprocessors     %d\n", d.multi_processor_count);
         std::printf("  VRAM total / free   %s / %s\n", human(d.total_bytes).c_str(), human(d.free_bytes).c_str());
         std::printf("  driver / runtime    %d / %d\n", d.driver_version, d.runtime_version);
